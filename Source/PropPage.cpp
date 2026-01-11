@@ -2438,7 +2438,7 @@ HRESULT CVRPageFlipPPage::OnActivate()
 	AddHint(IDC_EM_SENSOR_FILTER, L"Sensor filter mode (0=off, 1=mode 1).");
 	AddHint(IDC_EM_READ, L"Read current settings from the emitter.");
 	AddHint(IDC_EM_APPLY, L"Apply settings to the emitter.");
-	AddHint(IDC_EM_SAVE_EEPROM, L"Save current emitter settings to EEPROM.");
+	AddHint(IDC_EM_SAVE_EEPROM, L"Save current emitter settings to EEPROM. Calibration hotkey: B saves to EEPROM.");
 	AddHint(IDC_EM_LOAD_JSON, L"Load emitter settings from JSON.");
 	AddHint(IDC_EM_SAVE_JSON, L"Save emitter settings to JSON.");
 	AddHint(IDC_EM_UPDATE_FIRMWARE, L"Open firmware update dialog. Disabled while playback is active or the emitter is connected.");

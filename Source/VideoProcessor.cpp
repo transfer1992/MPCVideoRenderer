@@ -519,6 +519,9 @@ void CVideoProcessor::PageFlipThreadProc()
 		const PageFlipEye eye = static_cast<PageFlipEye>(eyeValue);
 
 		bool waited = WaitForVBlank();
+		if (m_pageFlipStopRequested.load()) {
+			break;
+		}
 		m_pageFlipSkipVBlank = waited;
 		m_pageFlipSerial.QueueSignal(eye);
 
@@ -718,24 +721,31 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 		text.append(m_pageFlipCalibrationMessage);
 	}
 	if (m_pageFlipShowCalibrationHelp) {
-		if (!text.empty()) {
-			text.append(L"\n");
+		auto appendLine = [&](const wchar_t* line) {
+			if (!text.empty()) {
+				text.append(L"\n");
+			}
+			text.append(line);
+		};
+		appendLine(L"G: Toggle calibration help overlay.");
+		appendLine(L"T: Toggle drive mode (0=optical, 1=serial).");
+		appendLine(L"B: Save current emitter settings to EEPROM.");
+		appendLine(L"I/K: (us) Delay after signal before activating glasses.");
+		appendLine(L"O/L: (us) Duration to keep glasses active after activation.");
+		appendLine(L"Shift: Use larger step sizes for adjustments.");
+		if (!serialMode) {
+			appendLine(L"W/S: Whitebox vertical position; roughly mm when display size is correct.");
+			appendLine(L"A/D: Whitebox horizontal position; roughly mm when display size is correct.");
+			appendLine(L"Q/E: Spacing between the two whiteboxes; roughly mm when display size is correct.");
+			appendLine(L"Z/X: Whitebox size; too large causes crosstalk, too small misses triggers.");
+			appendLine(L"N/M: Width of black border that blocks video content from the trigger boxes.");
+			appendLine(L"P: Toggle optical debug logging.");
 		}
-		if (serialMode) {
-			text.append(L"Cal: I/K frame delay (us)  O/L frame duration (us)");
-			text.append(L"\nShift=big  G=help  T=drive mode");
-		} else {
-			text.append(L"Cal: W/S move up/down  A/D move left/right");
-			text.append(L"\nQ/E spacing  Z/X size  N/M border");
-			text.append(L"\nI/K frame delay (us)  O/L frame duration (us)");
-			text.append(L"\nShift=big  G=help  P=opt debug log  T=drive mode");
-		}
-		text.append(std::format(L"\nDrive mode: {}", serialMode ? L"serial" : L"optical"));
-		if (m_pageFlipConfig.calibrationMode) {
-			text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes");
-		} else {
-			text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
-		}
+		const std::wstring driveLine = std::format(L"Drive mode: {}", serialMode ? L"serial" : L"optical");
+		appendLine(driveLine.c_str());
+		appendLine(m_pageFlipConfig.calibrationMode
+			? L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes"
+			: L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
 	 }
 
 	if (!text.empty()) {
@@ -992,6 +1002,17 @@ bool CVideoProcessor::HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		displayChanged = true;
 		emitterChanged = true;
 		break;
+	case 'B': {
+		if (!m_pageFlipSerial.IsConnected()) {
+			m_pageFlipCalibrationMessage = L"save EEPROM requires emitter connection";
+		} else if (SavePageFlipEmitterSettings()) {
+			m_pageFlipCalibrationMessage = L"emitter settings saved to EEPROM";
+		} else {
+			m_pageFlipCalibrationMessage = L"save EEPROM failed";
+		}
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		return true;
+	}
 	case 'W':
 	case 'S': {
 		if (serialMode) {
