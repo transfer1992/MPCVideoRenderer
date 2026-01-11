@@ -41,12 +41,14 @@ const AMOVIESETUP_PIN sudpPins[] = {
 };
 
 const AMOVIESETUP_FILTER sudFilter[] = {
-	{&__uuidof(CMpcVideoRenderer), L"MPC Video Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
+	{&__uuidof(CMpcVideoRenderer), L"MPC Pageflipping Video Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
 };
 
 CFactoryTemplate g_Templates[] = {
 	{sudFilter[0].strName, &__uuidof(CMpcVideoRenderer), CreateInstance<CMpcVideoRenderer>, nullptr, &sudFilter[0]},
 	{L"MainProp", &__uuidof(CVRMainPPage), CreateInstance<CVRMainPPage>, nullptr, nullptr},
+	{L"PageFlipProp", &__uuidof(CVRPageFlipPPage), CreateInstance<CVRPageFlipPPage>, nullptr, nullptr},
+	{L"EmitterProp", &__uuidof(CVREmitterPPage), CreateInstance<CVREmitterPPage>, nullptr, nullptr},
 	{L"InfoProp", &__uuidof(CVRInfoPPage), CreateInstance<CVRInfoPPage>, nullptr, nullptr}
 };
 

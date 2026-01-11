@@ -327,6 +327,9 @@ CDX9VideoProcessor::CDX9VideoProcessor(CMpcVideoRenderer* pFilter, const Setting
 
 CDX9VideoProcessor::~CDX9VideoProcessor()
 {
+	StopPageFlipThread();
+	m_pageFlipSerial.Stop();
+
 	m_pFilter->m_pSubPicQueue.Release();
 	m_pSubPicAllocator.Release();
 
@@ -346,6 +349,19 @@ CDX9VideoProcessor::~CDX9VideoProcessor()
 	MH_RemoveHook(SetWindowLongA);
 	MH_RemoveHook(SetWindowPos);
 	MH_RemoveHook(ShowWindow);
+}
+
+bool CDX9VideoProcessor::WaitForVBlank()
+{
+	CComPtr<IDirect3DDevice9Ex> dev = m_pD3DDevEx;
+	if (!dev) {
+		return false;
+	}
+	const HRESULT hr = dev->WaitForVBlank(0);
+	if (FAILED(hr)) {
+		m_pageFlipLogger.Log(PageFlipLogLevel::Debug, L"Pageflip: WaitForVBlank failed.");
+	}
+	return SUCCEEDED(hr);
 }
 
 void CDX9VideoProcessor::DeviceThreadFunc()
@@ -551,6 +567,11 @@ HRESULT CDX9VideoProcessor::InitInternal(bool* pChangeDevice/* = nullptr*/)
 			hr2 = m_Underlay.InitDeviceObjects(m_pD3DDevEx);
 			hr2 = m_Lines.InitDeviceObjects(m_pD3DDevEx);
 			hr2 = m_SyncLine.InitDeviceObjects(m_pD3DDevEx);
+			hr2 = m_PageFlipBlack.InitDeviceObjects(m_pD3DDevEx);
+			hr2 = m_PageFlipWhiteLeft.InitDeviceObjects(m_pD3DDevEx);
+			hr2 = m_PageFlipWhiteRight.InitDeviceObjects(m_pD3DDevEx);
+			hr2 = m_PageFlipReticleH.InitDeviceObjects(m_pD3DDevEx);
+			hr2 = m_PageFlipReticleV.InitDeviceObjects(m_pD3DDevEx);
 			DLogIf(FAILED(hr2), L"Geometric primitives InitDeviceObjects() failed with error {}", HR2Str(hr2));
 		}
 		ASSERT(S_OK == hr2);
@@ -730,6 +751,11 @@ void CDX9VideoProcessor::ReleaseDevice()
 	m_Underlay.InvalidateDeviceObjects();
 	m_Lines.InvalidateDeviceObjects();
 	m_SyncLine.InvalidateDeviceObjects();
+	m_PageFlipBlack.InvalidateDeviceObjects();
+	m_PageFlipWhiteLeft.InvalidateDeviceObjects();
+	m_PageFlipWhiteRight.InvalidateDeviceObjects();
+	m_PageFlipReticleH.InvalidateDeviceObjects();
+	m_PageFlipReticleV.InvalidateDeviceObjects();
 
 	m_pD3DDevEx.Release();
 }
@@ -1199,6 +1225,8 @@ BOOL CDX9VideoProcessor::InitMediaType(const CMediaType* pmt)
 		m_srcAnamorphic = (srcFrameARX != m_srcAspectRatioX || srcFrameARY != m_srcAspectRatioY);
 	}
 
+	UpdatePageFlipLayout();
+
 	UpdateUpscalingShaders();
 	UpdateDownscalingShaders();
 
@@ -1262,6 +1290,8 @@ BOOL CDX9VideoProcessor::InitMediaType(const CMediaType* pmt)
 
 HRESULT CDX9VideoProcessor::ProcessSample(IMediaSample* pSample)
 {
+	UpdatePageFlipSerialStatus();
+
 	REFERENCE_TIME rtStart, rtEnd;
 	if (FAILED(pSample->GetTime(&rtStart, &rtEnd))) {
 		rtStart = m_pFilter->m_FrameStats.GeTimestamp();
@@ -1275,6 +1305,11 @@ HRESULT CDX9VideoProcessor::ProcessSample(IMediaSample* pSample)
 	HRESULT hr = CopySample(pSample);
 	if (FAILED(hr)) {
 		m_RenderStats.failed++;
+		return hr;
+	}
+
+	OnPageFlipSampleReceived();
+	if (IsPageFlipEnabled() && UsePageFlipThread()) {
 		return hr;
 	}
 
@@ -1549,7 +1584,11 @@ HRESULT CDX9VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTim
 	m_pD3DDevEx->ColorFill(pBackBuffer, nullptr, 0);
 
 	if (!m_renderRect.IsRectEmpty()) {
-		hr = Process(pBackBuffer, m_srcRect, m_videoRect, m_FieldDrawn == 2);
+		CRect srcRect = m_srcRect;
+		GetPageFlipSrcRect(m_srcRect, srcRect);
+		CRect dstRect = m_videoRect;
+		GetPageFlipDstRect(m_videoRect, dstRect);
+		hr = Process(pBackBuffer, srcRect, dstRect, m_FieldDrawn == 2);
 	}
 
 	if (!m_pPSHalfOUtoInterlace) {
@@ -1560,6 +1599,9 @@ HRESULT CDX9VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTim
 
 	if (m_bShowStats) {
 		hr = DrawStats(pBackBuffer);
+	}
+	if (ShouldDrawPageFlipOverlay()) {
+		DrawPageFlipOverlay(pBackBuffer);
 	}
 
 	if (m_bAlphaBitmapEnable) {
@@ -1598,7 +1640,7 @@ HRESULT CDX9VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTim
 	uint64_t tick2 = GetPreciseTick();
 	m_RenderStats.paintticks = tick2 - tick1;
 
-	if (m_bVBlankBeforePresent) {
+	if ((m_bVBlankBeforePresent || IsPageFlipEnabled()) && !ShouldSkipVBlank()) {
 		hr = m_pD3DDevEx->WaitForVBlank(0);
 		DLogIf(FAILED(hr), L"WaitForVBlank failed with error {}", HR2Str(hr));
 	}
@@ -1641,6 +1683,9 @@ HRESULT CDX9VideoProcessor::FillBlack()
 
 	if (m_bShowStats) {
 		hr = DrawStats(pBackBuffer);
+	}
+	if (ShouldDrawPageFlipOverlay()) {
+		DrawPageFlipOverlay(pBackBuffer);
 	}
 
 	if (m_bAlphaBitmapEnable) {
@@ -2072,6 +2117,8 @@ void CDX9VideoProcessor::SetStereo3dTransform(int value)
 
 void CDX9VideoProcessor::Flush()
 {
+	ResetPageFlipState();
+
 	if (m_DXVA2VP.IsReady()) {
 		m_DXVA2VP.CleanSamples();
 	}
@@ -2640,11 +2687,14 @@ HRESULT CDX9VideoProcessor::Process(IDirect3DSurface9* pRenderTarget, const CRec
 	m_bDitherUsed = false;
 
 	CRect rSrc = srcRect;
+	const CRect inputSrc = srcRect;
 	IDirect3DTexture9* pInputTexture = nullptr;
+	const wchar_t* processPath = L"unknown";
 
 	const UINT numSteps = GetPostScaleSteps();
 
 	if (m_DXVA2VP.IsReady()) {
+		processPath = L"dxva2vp";
 		const bool bNeedShaderTransform =
 			(m_TexConvertOutput.Width != dstRect.Width() || m_TexConvertOutput.Height != dstRect.Height() || m_iRotation || m_bFlip
 			|| dstRect.left < 0 || dstRect.top < 0 || dstRect.right > m_windowRect.right || dstRect.bottom > m_windowRect.bottom);
@@ -2662,12 +2712,28 @@ HRESULT CDX9VideoProcessor::Process(IDirect3DSurface9* pRenderTarget, const CRec
 		rSrc = rect;
 	}
 	else if (m_PSConvColorData.bEnable) {
+		processPath = L"shader_conv";
 		ConvertColorPass(m_TexConvertOutput.pSurface);
 		pInputTexture = m_TexConvertOutput.pTexture;
-		rSrc.SetRect(0, 0, m_TexConvertOutput.Width, m_TexConvertOutput.Height);
+		const CRect texRect(0, 0, m_TexConvertOutput.Width, m_TexConvertOutput.Height);
+		rSrc.IntersectRect(rSrc, texRect);
 	}
 	else {
+		processPath = L"shader_direct";
 		pInputTexture = m_TexSrcVideo.pTexture;
+	}
+
+	if (IsPageFlipEnabled() && !m_pageFlipLoggedProcess && m_pageFlipLogger.GetLevel() >= PageFlipLogLevel::Debug) {
+		m_pageFlipLoggedProcess = true;
+		m_pageFlipLogger.Log(PageFlipLogLevel::Debug,
+			L"Pageflip process dx9: path={} inputSrc={}x{}@{},{} rSrc={}x{}@{},{} dst={}x{}@{},{} video={}x{} srcRect={}x{} fmt={}",
+			processPath,
+			inputSrc.Width(), inputSrc.Height(), inputSrc.left, inputSrc.top,
+			rSrc.Width(), rSrc.Height(), rSrc.left, rSrc.top,
+			dstRect.Width(), dstRect.Height(), dstRect.left, dstRect.top,
+			m_videoRect.Width(), m_videoRect.Height(),
+			m_srcRectWidth, m_srcRectHeight,
+			m_srcParams.str ? m_srcParams.str : L"unknown");
 	}
 
 	if (numSteps) {
@@ -3166,6 +3232,94 @@ HRESULT CDX9VideoProcessor::DrawStats(IDirect3DSurface9* pRenderTarget)
 	}
 
 	return hr;
+}
+
+HRESULT CDX9VideoProcessor::DrawPageFlipOverlay(IDirect3DSurface9* pRenderTarget)
+{
+	const std::wstring statusText = GetPageFlipStatusText();
+	const std::wstring calibrationText = GetPageFlipCalibrationText();
+	if (statusText.empty() && calibrationText.empty() && !ShouldDrawPageFlipBoxes()) {
+		return S_FALSE;
+	}
+	if (m_windowRect.IsRectEmpty()) {
+		return E_ABORT;
+	}
+
+	const PageFlipConfig cfg = GetPageFlipConfig();
+	HRESULT hr = m_pD3DDevEx->SetRenderTarget(0, pRenderTarget);
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	PageFlipOverlayLayout layout = {};
+	const SIZE renderSize = { m_windowRect.Width(), m_windowRect.Height() };
+	if (CalcPageFlipOverlayLayout(renderSize, layout) && layout.showBoxes) {
+		const int brightness = std::clamp(cfg.whiteboxBrightness, 0, 255);
+		const D3DCOLOR white = D3DCOLOR_XRGB(brightness, brightness, brightness);
+
+		if (layout.showCalibration) {
+			m_PageFlipBlack.Set(layout.calibrationBlack, D3DCOLOR_XRGB(0, 0, 0));
+			m_PageFlipBlack.Draw();
+			if (layout.showReticle) {
+				m_PageFlipReticleH.Set(layout.reticleH, white);
+				m_PageFlipReticleH.Draw();
+				m_PageFlipReticleV.Set(layout.reticleV, white);
+				m_PageFlipReticleV.Draw();
+			}
+		}
+
+		m_PageFlipBlack.Set(layout.black, D3DCOLOR_XRGB(0, 0, 0));
+		m_PageFlipBlack.Draw();
+
+		int eye = m_pageFlipEye.load();
+		if (cfg.flipEyes) {
+			eye = eye ? 0 : 1;
+		}
+
+		if (eye == 0) {
+			m_PageFlipWhiteLeft.Set(layout.whiteLeft, white);
+			m_PageFlipWhiteLeft.Draw();
+		} else {
+			m_PageFlipWhiteRight.Set(layout.whiteRight, white);
+			m_PageFlipWhiteRight.Draw();
+		}
+	}
+
+	if (!statusText.empty()) {
+		const bool isTop = cfg.whiteboxCorner == PageFlipCornerPosition::TopLeft
+			|| cfg.whiteboxCorner == PageFlipCornerPosition::TopRight;
+		int x = 10;
+		int y = 10;
+		if (isTop) {
+			SIZE textSize = {};
+			if (SUCCEEDED(m_Font3D.GetTextExtent(statusText.c_str(), &textSize))) {
+				const int renderH = static_cast<int>(renderSize.cy);
+				const int textH = static_cast<int>(textSize.cy);
+				y = std::max(10, renderH - textH - 10);
+			}
+		} else if (m_bShowStats) {
+			y = m_StatsRect.bottom + 8;
+		}
+
+		m_Font3D.Draw2DText(x, y, D3DCOLOR_XRGB(255, 255, 255), statusText.c_str());
+	}
+
+	if (!calibrationText.empty()) {
+		SIZE textSize = {};
+		if (SUCCEEDED(m_Font3D.GetTextExtent(calibrationText.c_str(), &textSize))) {
+			const int renderW = static_cast<int>(renderSize.cx);
+			const int renderH = static_cast<int>(renderSize.cy);
+			const int textW = static_cast<int>(textSize.cx);
+			const int textH = static_cast<int>(textSize.cy);
+			const int x = std::max(0, (renderW - textW) / 2);
+			const int y = std::max(0, (renderH - textH) / 2);
+			m_Font3D.Draw2DText(x, y, D3DCOLOR_XRGB(255, 255, 255), calibrationText.c_str());
+		} else {
+			m_Font3D.Draw2DText(10, 10, D3DCOLOR_XRGB(255, 255, 255), calibrationText.c_str());
+		}
+	}
+
+	return S_OK;
 }
 
 // IMFVideoProcessor

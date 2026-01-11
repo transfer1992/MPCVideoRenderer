@@ -21,12 +21,15 @@
 #include "stdafx.h"
 #include <atomic>
 #include <optional>
+#include <vector>
 #include <evr.h> // for MR_VIDEO_ACCELERATION_SERVICE, because the <mfapi.h> does not contain it
 #include <Mferror.h>
+#include <hidusage.h>
 #include "Helper.h"
 #include "PropPage.h"
 #include "VideoRendererInputPin.h"
 #include "../Include/Version.h"
+#include "PageFlip.h"
 #include "VideoRenderer.h"
 #include "SubPic/XySubPicProvider.h"
 #include "SubPic/XySubPicQueueImpl.h"
@@ -88,6 +91,14 @@ static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM
 	auto pfnOldProc = (WNDPROC)GetPropW(hWnd, g_pszOldParentWndProc);
 	auto pThis = static_cast<CMpcVideoRenderer*>(GetPropW(hWnd, g_pszThis));
 
+	if (Msg == WM_INPUT && pThis && pThis->HandleRawInputMessage((HRAWINPUT)lParam, L"parent_raw")) {
+		return 0L;
+	}
+
+	if (pThis && pThis->HandlePageFlipKeyMessage(Msg, wParam, lParam)) {
+		return 0L;
+	}
+
 	switch (Msg) {
 		case WM_DESTROY:
 			SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)pfnOldProc);
@@ -136,7 +147,7 @@ static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM
 //
 
 CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
-	: CBaseVideoRenderer2(__uuidof(this), L"MPC Video Renderer", pUnk, phr)
+	: CBaseVideoRenderer2(__uuidof(this), L"MPC Pageflipping Video Renderer", pUnk, phr)
 {
 	DLog(L"CMpcVideoRenderer::CMpcVideoRenderer()");
 
@@ -867,12 +878,15 @@ STDMETHODIMP CMpcVideoRenderer::SetDestinationPosition(long Left, long Top, long
 		return S_OK;
 	}
 
-	if (videoRect != m_videoRect) {
-		m_videoRect = videoRect;
+	m_videoRectBase = videoRect;
+	const CRect zoomedRect = CalcPageFlipZoomRect(videoRect);
+
+	if (zoomedRect != m_videoRect) {
+		m_videoRect = zoomedRect;
 
 		CAutoLock cRendererLock(&m_RendererLock);
 
-		m_VideoProcessor->SetVideoRect(videoRect);
+		m_VideoProcessor->SetVideoRect(m_videoRect);
 	}
 
 	if (m_bForceRedrawing) {
@@ -1059,6 +1073,8 @@ HRESULT CMpcVideoRenderer::Init(const bool bCreateWindow/* = false*/)
 		DoAfterChangingDevice();
 	}
 
+	UpdateRawInputRegistration();
+
 	return hr;
 }
 
@@ -1182,16 +1198,17 @@ STDMETHODIMP CMpcVideoRenderer::GetPages(CAUUID* pPages)
 
 	static const GUID guidQualityPPage = { 0x565DCEF2, 0xAFC5, 0x11D2, 0x88, 0x53, 0x00, 0x00, 0xF8, 0x08, 0x83, 0xE3 };
 
-	pPages->cElems = GetActive() ? 3 : 1;
+	pPages->cElems = GetActive() ? 4 : 2;
 	pPages->pElems = static_cast<GUID*>(CoTaskMemAlloc(sizeof(GUID) * pPages->cElems));
 	if (pPages->pElems == nullptr) {
 		return E_OUTOFMEMORY;
 	}
 
 	pPages->pElems[0] = __uuidof(CVRMainPPage);
-	if (pPages->cElems == 3) {
-		pPages->pElems[1] = __uuidof(CVRInfoPPage);
-		pPages->pElems[2] = guidQualityPPage;
+	pPages->pElems[1] = __uuidof(CVRPageFlipPPage);
+	if (pPages->cElems == 4) {
+		pPages->pElems[2] = __uuidof(CVRInfoPPage);
+		pPages->pElems[3] = guidQualityPPage;
 	}
 
 	return S_OK;
@@ -1309,6 +1326,10 @@ STDMETHODIMP CMpcVideoRenderer::Flt_GetBool(LPCSTR field, bool* value)
 		*value = m_VideoProcessor->GetDoubleRate();
 		return S_OK;
 	}
+	if (!strcmp(field, "pageflip_emitter_dirty")) {
+		*value = m_VideoProcessor->IsPageFlipEmitterDirty();
+		return S_OK;
+	}
 
 	return E_INVALIDARG;
 }
@@ -1364,6 +1385,35 @@ STDMETHODIMP CMpcVideoRenderer::Flt_GetBin(LPCSTR field, LPVOID* value, unsigned
 		HRESULT hr = m_VideoProcessor->GetDisplayedImage((BYTE**)value, size);
 
 		return hr;
+	}
+
+	if (!strcmp(field, "pageflip_emitter_state")) {
+		const PageFlipEmitterState state = m_VideoProcessor->GetPageFlipEmitterState();
+		PageFlipEmitterStateBin bin = {};
+		bin.config = ToPageFlipConfigBin(state.config);
+		bin.firmwareVersion = state.firmwareVersion;
+		bin.connected = state.connected ? 1 : 0;
+
+		LPVOID buffer = LocalAlloc(LPTR, sizeof(bin));
+		if (!buffer) {
+			return E_OUTOFMEMORY;
+		}
+		memcpy(buffer, &bin, sizeof(bin));
+		*value = buffer;
+		*size = sizeof(bin);
+		return S_OK;
+	}
+	if (!strcmp(field, "pageflip_emitter_local_settings")) {
+		const LocalEmitterSettings settings = m_VideoProcessor->GetLocalEmitterSettings();
+		const LocalEmitterSettingsBin bin = ToLocalEmitterSettingsBin(settings);
+		LPVOID buffer = LocalAlloc(LPTR, sizeof(bin));
+		if (!buffer) {
+			return E_OUTOFMEMORY;
+		}
+		memcpy(buffer, &bin, sizeof(bin));
+		*value = buffer;
+		*size = sizeof(bin);
+		return S_OK;
 	}
 
 	return E_INVALIDARG;
@@ -1423,6 +1473,43 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetBool(LPCSTR field, bool value)
 		return S_OK;
 	}
 
+	if (!strcmp(field, "pageflip_reload_config")) {
+		if (value) {
+			m_VideoProcessor->ReloadPageFlipConfig(true);
+		}
+		return S_OK;
+	}
+
+	if (!strcmp(field, "pageflip_emitter_connect")) {
+		CAutoLock cRendererLock(&m_RendererLock);
+		LocalEmitterSettings localSettings = m_VideoProcessor->GetLocalEmitterSettings();
+		localSettings.disableAutoConnect = value ? false : true;
+		m_VideoProcessor->SetLocalEmitterSettings(localSettings, true);
+		const bool connected = m_VideoProcessor->SetPageFlipEmitterConnected(value);
+		if (connected) {
+			PageFlipEmitterState state = {};
+			m_VideoProcessor->RefreshPageFlipEmitter(state, true);
+		}
+		return S_OK;
+	}
+
+	if (!strcmp(field, "pageflip_emitter_refresh")) {
+		if (value) {
+			CAutoLock cRendererLock(&m_RendererLock);
+			PageFlipEmitterState state = {};
+			m_VideoProcessor->RefreshPageFlipEmitter(state, false);
+		}
+		return S_OK;
+	}
+
+	if (!strcmp(field, "pageflip_emitter_save")) {
+		if (value) {
+			CAutoLock cRendererLock(&m_RendererLock);
+			m_VideoProcessor->SavePageFlipEmitterSettings();
+		}
+		return S_OK;
+	}
+
 	return E_INVALIDARG;
 }
 
@@ -1458,6 +1545,39 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetInt(LPCSTR field, int value)
 
 STDMETHODIMP CMpcVideoRenderer::Flt_SetBin(LPCSTR field, LPVOID value, int size)
 {
+	if (!strcmp(field, "pageflip_apply_config")) {
+		if (!value || size != sizeof(PageFlipConfigBin)) {
+			return E_INVALIDARG;
+		}
+		CAutoLock cRendererLock(&m_RendererLock);
+		const PageFlipConfigBin* bin = reinterpret_cast<const PageFlipConfigBin*>(value);
+		const PageFlipConfig base = m_VideoProcessor->GetPageFlipConfig();
+		const PageFlipConfig config = FromPageFlipConfigBin(*bin, base);
+		m_VideoProcessor->SetPageFlipConfig(config, true);
+		return S_OK;
+	}
+
+	if (!strcmp(field, "pageflip_emitter_apply")) {
+		if (!value || size != sizeof(PageFlipConfigBin)) {
+			return E_INVALIDARG;
+		}
+		CAutoLock cRendererLock(&m_RendererLock);
+		const PageFlipConfigBin* bin = reinterpret_cast<const PageFlipConfigBin*>(value);
+		const PageFlipConfig base = m_VideoProcessor->GetPageFlipConfig();
+		const PageFlipConfig config = FromPageFlipConfigBin(*bin, base);
+		return m_VideoProcessor->ApplyPageFlipEmitterSettings(config) ? S_OK : E_FAIL;
+	}
+	if (!strcmp(field, "pageflip_emitter_local_settings")) {
+		if (!value || size != sizeof(LocalEmitterSettingsBin)) {
+			return E_INVALIDARG;
+		}
+		CAutoLock cRendererLock(&m_RendererLock);
+		const LocalEmitterSettingsBin* bin = reinterpret_cast<const LocalEmitterSettingsBin*>(value);
+		const LocalEmitterSettings settings = FromLocalEmitterSettingsBin(*bin);
+		m_VideoProcessor->SetLocalEmitterSettings(settings, true);
+		return S_OK;
+	}
+
 	if (size > 0) {
 		auto ReadShaderData = [&](std::wstring& shaderName, std::string& shaderCode) {
 			BYTE* p = (BYTE*)value;
@@ -1683,7 +1803,7 @@ STDMETHODIMP CMpcVideoRenderer::GetString(LPCSTR field, LPWSTR* value, int* char
 	std::wstring str;
 
 	if (!strcmp(field, "name")) {
-		str = L"MPC Video Renderer";
+		str = L"MPC Pageflipping Video Renderer";
 	}
 	else if (!strcmp(field, "version")) {
 		str = _CRT_WIDE(VERSION_STR);
@@ -1751,8 +1871,152 @@ void CMpcVideoRenderer::DoAfterChangingDevice()
 	}
 }
 
+CRect CMpcVideoRenderer::CalcPageFlipZoomRect(const CRect& base) const
+{
+	if (!m_VideoProcessor) {
+		return base;
+	}
+
+	const PageFlipConfig cfg = m_VideoProcessor->GetPageFlipConfig();
+	if (!cfg.enabled) {
+		return base;
+	}
+
+	int zoom = cfg.displayZoomFactor;
+	if (zoom < 1) {
+		zoom = 1;
+	} else if (zoom > 100) {
+		zoom = 100;
+	}
+	if (zoom >= 100) {
+		return base;
+	}
+
+	const int w = base.Width();
+	const int h = base.Height();
+	if (w <= 0 || h <= 0) {
+		return base;
+	}
+
+	const int newW = std::max(1, w * zoom / 100);
+	const int newH = std::max(1, h * zoom / 100);
+	const int cx = base.left + w / 2;
+	const int cy = base.top + h / 2;
+
+	CRect zoomed;
+	zoomed.left = cx - newW / 2;
+	zoomed.top = cy - newH / 2;
+	zoomed.right = zoomed.left + newW;
+	zoomed.bottom = zoomed.top + newH;
+	return zoomed;
+}
+
+void CMpcVideoRenderer::UpdateVideoRectForPageFlip()
+{
+	if (m_videoRectBase.IsRectNull() || !m_VideoProcessor) {
+		return;
+	}
+
+	const CRect zoomed = CalcPageFlipZoomRect(m_videoRectBase);
+	if (zoomed == m_videoRect) {
+		return;
+	}
+
+	m_videoRect = zoomed;
+	CAutoLock cRendererLock(&m_RendererLock);
+	m_VideoProcessor->SetVideoRect(m_videoRect);
+}
+
+void CMpcVideoRenderer::UpdateVideoSizeForPageFlip()
+{
+	if (!m_VideoProcessor) {
+		return;
+	}
+
+	CAutoLock cRendererLock(&m_RendererLock);
+
+	CSize aspectNew, framesizeNew;
+	m_VideoProcessor->GetAspectRatio(&aspectNew.cx, &aspectNew.cy);
+	m_VideoProcessor->GetVideoSize(&framesizeNew.cx, &framesizeNew.cy);
+
+	if (aspectNew != m_videoAspectRatio || framesizeNew != m_videoSize) {
+		if (m_pSink) {
+			m_pSink->Notify(EC_VIDEO_SIZE_CHANGED, MAKELPARAM(framesizeNew.cx, framesizeNew.cy), 0);
+		}
+		m_videoSize = framesizeNew;
+		m_videoAspectRatio = aspectNew;
+		if (m_bForceRedrawing) {
+			Redraw();
+		}
+	}
+}
+
+void CMpcVideoRenderer::ShowPropertyPages()
+{
+	static std::atomic_bool s_open = false;
+	if (s_open.exchange(true)) {
+		return;
+	}
+
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	const bool doUninit = SUCCEEDED(hrInit);
+
+	ISpecifyPropertyPages* pProp = nullptr;
+	HRESULT hr = QueryInterface(IID_ISpecifyPropertyPages, (void**)&pProp);
+	if (SUCCEEDED(hr) && pProp) {
+		FILTER_INFO filterInfo = {};
+		hr = QueryFilterInfo(&filterInfo);
+		if (SUCCEEDED(hr) && filterInfo.pGraph) {
+			filterInfo.pGraph->Release();
+		}
+
+		IUnknown* pFilterUnk = nullptr;
+		QueryInterface(IID_IUnknown, (void**)&pFilterUnk);
+
+		CAUUID pages = {};
+		pProp->GetPages(&pages);
+		pProp->Release();
+
+		const HWND parent = m_hWndParentMain ? m_hWndParentMain : (m_hWndParent ? m_hWndParent : m_hWndWindow);
+		OleCreatePropertyFrame(
+			parent,
+			0, 0,
+			filterInfo.achName,
+			1,
+			&pFilterUnk,
+			pages.cElems,
+			pages.pElems,
+			0,
+			0, nullptr
+		);
+
+		if (pFilterUnk) {
+			pFilterUnk->Release();
+		}
+		CoTaskMemFree(pages.pElems);
+	}
+
+	if (doUninit) {
+		CoUninitialize();
+	}
+
+	s_open = false;
+}
+
 LRESULT CMpcVideoRenderer::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+	if (uMsg == WM_INPUT && m_VideoProcessor) {
+		if (HandleRawInputMessage((HRAWINPUT)lParam, L"renderer_raw")) {
+			return 0L;
+		}
+	}
+
+	if ((uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) && m_VideoProcessor) {
+		if (m_VideoProcessor->HandlePageFlipKeyMessage(uMsg, wParam, lParam, L"renderer")) {
+			return 0L;
+		}
+	}
+
 	if (m_hWndDrain && !InSendMessage() && !m_bExclusiveScreen) {
 		switch (uMsg) {
 			case WM_CHAR:
@@ -1795,4 +2059,96 @@ LRESULT CMpcVideoRenderer::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam,
 	}
 
 	return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+bool CMpcVideoRenderer::HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if ((uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) && m_VideoProcessor) {
+		return m_VideoProcessor->HandlePageFlipKeyMessage(uMsg, wParam, lParam, L"parent");
+	}
+	UNREFERENCED_PARAMETER(lParam);
+	return false;
+}
+
+bool CMpcVideoRenderer::HandleRawInputMessage(HRAWINPUT hRawInput, const wchar_t* source)
+{
+	if (!m_VideoProcessor || !hRawInput) {
+		return false;
+	}
+
+	UINT size = 0;
+	if (GetRawInputData(hRawInput, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0) {
+		return false;
+	}
+
+	std::vector<BYTE> buffer(size);
+	if (GetRawInputData(hRawInput, RID_INPUT, buffer.data(), &size, sizeof(RAWINPUTHEADER)) != size) {
+		return false;
+	}
+
+	const RAWINPUT* raw = reinterpret_cast<const RAWINPUT*>(buffer.data());
+	if (raw->header.dwType != RIM_TYPEKEYBOARD) {
+		return false;
+	}
+
+	const RAWKEYBOARD& kbd = raw->data.keyboard;
+	if (kbd.VKey == 0 || kbd.VKey == 0xFF) {
+		return false;
+	}
+
+	const bool isBreak = (kbd.Flags & RI_KEY_BREAK) != 0;
+	const bool isSys = (kbd.Message == WM_SYSKEYDOWN || kbd.Message == WM_SYSKEYUP);
+	const UINT msg = isSys ? (isBreak ? WM_SYSKEYUP : WM_SYSKEYDOWN) : (isBreak ? WM_KEYUP : WM_KEYDOWN);
+
+	bool handled = false;
+	if (!isBreak) {
+		handled = m_VideoProcessor->HandlePageFlipKeyMessage(msg, kbd.VKey, 0, source);
+	}
+
+	const PageFlipConfig cfg = m_VideoProcessor->GetPageFlipConfig();
+	if (cfg.calibrationMode && !handled) {
+		HWND target = m_hWndDrain;
+		if (!target) {
+			target = m_hWndParentMain ? m_hWndParentMain : m_hWndParent;
+		}
+		if (target) {
+			PostMessageW(target, msg, kbd.VKey, 0);
+		}
+	}
+
+	return handled;
+}
+
+void CMpcVideoRenderer::UpdateRawInputRegistration()
+{
+	HWND target = m_hWndParentMain ? m_hWndParentMain : (m_hWndWindow ? m_hWndWindow : m_hWnd);
+	if (!target) {
+		return;
+	}
+
+	bool wantNoLegacy = false;
+	if (m_VideoProcessor) {
+		const PageFlipConfig cfg = m_VideoProcessor->GetPageFlipConfig();
+		wantNoLegacy = cfg.calibrationMode;
+	}
+
+	if (m_rawInputRegistered && target == m_hRawInputTarget && wantNoLegacy == m_rawInputNoLegacy) {
+		return;
+	}
+
+	RAWINPUTDEVICE rid = {};
+	rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
+	rid.usUsage = HID_USAGE_GENERIC_KEYBOARD;
+	rid.dwFlags = RIDEV_INPUTSINK | (wantNoLegacy ? RIDEV_NOLEGACY : 0);
+	rid.hwndTarget = target;
+
+	if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+		const DWORD err = GetLastError();
+		DLog(L"UpdateRawInputRegistration() failed: {}", err);
+		return;
+	}
+
+	m_rawInputRegistered = true;
+	m_rawInputNoLegacy = wantNoLegacy;
+	m_hRawInputTarget = target;
 }

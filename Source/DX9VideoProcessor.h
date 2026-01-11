@@ -100,6 +100,11 @@ private:
 	CD3D9Rectangle m_Underlay;
 	CD3D9Lines     m_Lines;
 	CD3D9Polyline  m_SyncLine;
+	CD3D9Rectangle m_PageFlipBlack;
+	CD3D9Rectangle m_PageFlipWhiteLeft;
+	CD3D9Rectangle m_PageFlipWhiteRight;
+	CD3D9Rectangle m_PageFlipReticleH;
+	CD3D9Rectangle m_PageFlipReticleV;
 
 	// SubPic
 	CComPtr<CDX9SubPicAllocator> m_pSubPicAllocator;
@@ -118,6 +123,7 @@ private:
 	HRESULT InitInternal(bool* pChangeDevice = nullptr);
 	HRESULT ResetInternal();
 	void ResizeInternal();
+	bool WaitForVBlank() override;
 
 public:
 	CDX9VideoProcessor(CMpcVideoRenderer* pFilter, const Settings_t& config, HRESULT& hr);
@@ -211,6 +217,7 @@ private:
 	void UpdateStatsStatic();
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(IDirect3DSurface9* pRenderTarget);
+	HRESULT DrawPageFlipOverlay(IDirect3DSurface9* pRenderTarget);
 
 public:
 	// IMFVideoProcessor

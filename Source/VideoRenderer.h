@@ -122,6 +122,7 @@ private:
 	ISubRender11Callback* m_pSub11CallBack = nullptr;
 
 	CRect m_windowRect, m_videoRect;
+	CRect m_videoRectBase;
 
 	bool m_bForceRedrawing = true;
 
@@ -157,6 +158,9 @@ public:
 	void UpdateDisplayInfo();
 	void OnDisplayModeChange(const bool bReset = false);
 	void OnWindowMove();
+	void UpdateVideoRectForPageFlip();
+	void UpdateVideoSizeForPageFlip();
+	void ShowPropertyPages();
 
 	DECLARE_IUNKNOWN
 	STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void** ppv);
@@ -320,12 +324,19 @@ public:
 	CComPtr<ISubPic> GetSubPic(REFERENCE_TIME rtStart);
 
 	LRESULT OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+	bool HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM lParam);
+	bool HandleRawInputMessage(HRAWINPUT hRawInput, const wchar_t* source);
+	void UpdateRawInputRegistration();
 
 	bool m_bExclusiveScreen = false;
 	bool m_bIsD3DFullscreen = false;
 	bool m_bFullScreen      = false;
+	bool m_rawInputRegistered = false;
+	bool m_rawInputNoLegacy = false;
+	HWND m_hRawInputTarget = nullptr;
 
 private:
 	HRESULT Redraw();
 	void DoAfterChangingDevice();
+	CRect CalcPageFlipZoomRect(const CRect& base) const;
 };

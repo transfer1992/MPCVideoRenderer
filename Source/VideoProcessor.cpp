@@ -20,24 +20,44 @@
 
 #include "stdafx.h"
 
+#include <cmath>
+#include <limits>
 #include <Mferror.h>
 #include "Helper.h"
+#include "Times.h"
 #include "VideoRenderer.h"
 
 #include "VideoProcessor.h"
 #include <shellscalingapi.h>
+
+static std::wstring GetPageFlipConfigFolder(const std::wstring& configPath)
+{
+	const size_t pos = configPath.find_last_of(L"\\/");
+	if (pos == std::wstring::npos) {
+		return L".";
+	}
+	return configPath.substr(0, pos);
+}
 
 HRESULT CVideoProcessor::GetVideoSize(long *pWidth, long *pHeight)
 {
 	CheckPointer(pWidth, E_POINTER);
 	CheckPointer(pHeight, E_POINTER);
 
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	UINT srcWidth = m_srcRectWidth;
+	UINT srcHeight = m_srcRectHeight;
+	if (m_pageFlipConfig.enabled && m_pageFlipLayout != PageFlipLayout::None && m_pageFlipViewWidth && m_pageFlipViewHeight) {
+		srcWidth = m_pageFlipViewWidth;
+		srcHeight = m_pageFlipViewHeight;
+	}
+
 	if (m_iRotation == 90 || m_iRotation == 270) {
-		*pWidth  = m_srcRectHeight;
-		*pHeight = m_srcRectWidth;
+		*pWidth  = srcHeight;
+		*pHeight = srcWidth;
 	} else {
-		*pWidth  = m_srcRectWidth;
-		*pHeight = m_srcRectHeight;
+		*pWidth  = srcWidth;
+		*pHeight = srcHeight;
 	}
 
 	return S_OK;
@@ -48,15 +68,1117 @@ HRESULT CVideoProcessor::GetAspectRatio(long *plAspectX, long *plAspectY)
 	CheckPointer(plAspectX, E_POINTER);
 	CheckPointer(plAspectY, E_POINTER);
 
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	DWORD aspectX = m_srcAspectRatioX;
+	DWORD aspectY = m_srcAspectRatioY;
+	if (m_pageFlipConfig.enabled && m_pageFlipLayout != PageFlipLayout::None && m_pageFlipAspectRatioX && m_pageFlipAspectRatioY) {
+		aspectX = m_pageFlipAspectRatioX;
+		aspectY = m_pageFlipAspectRatioY;
+	}
+
 	if (m_iRotation == 90 || m_iRotation == 270) {
-		*plAspectX = m_srcAspectRatioY;
-		*plAspectY = m_srcAspectRatioX;
+		*plAspectX = aspectY;
+		*plAspectY = aspectX;
 	} else {
-		*plAspectX = m_srcAspectRatioX;
-		*plAspectY = m_srcAspectRatioY;
+		*plAspectX = aspectX;
+		*plAspectY = aspectY;
 	}
 
 	return S_OK;
+}
+
+CVideoProcessor::~CVideoProcessor()
+{
+	StopPageFlipThread();
+	m_pageFlipSerial.Stop();
+	if (m_pageFlipWakeEvent) {
+		CloseHandle(m_pageFlipWakeEvent);
+		m_pageFlipWakeEvent = nullptr;
+	}
+}
+
+void CVideoProcessor::InitPageFlip()
+{
+	m_pageFlipConfigPath = GetDefaultPageFlipConfigPath();
+	m_pageFlipLocalEmitterPath = GetLocalEmitterSettingsPath(m_pageFlipConfigPath);
+	m_pageFlipLogPath = GetPageFlipLogPath(m_pageFlipConfigPath);
+	m_pageFlipWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	m_pageFlipLocalEmitterSettings = LoadLocalEmitterSettings(m_pageFlipConfigPath);
+	PageFlipConfig cfg = LoadPageFlipConfig(m_pageFlipConfigPath);
+	cfg.comPort = m_pageFlipLocalEmitterSettings.comPort;
+	ApplyPageFlipConfig(cfg, true);
+}
+
+void CVideoProcessor::ReloadPageFlipConfig(bool force)
+{
+	PageFlipConfig cfg = LoadPageFlipConfig(m_pageFlipConfigPath);
+	ApplyPageFlipConfig(cfg, force);
+}
+
+void CVideoProcessor::ApplyPageFlipConfig(const PageFlipConfig& config, bool force)
+{
+	PageFlipConfig normalized = config;
+	normalized.comPort = m_pageFlipLocalEmitterSettings.comPort;
+	m_pageFlipLogger.Configure(m_pageFlipLogPath, normalized.logLevel);
+
+	PageFlipConfig cfg;
+	bool calibrationExit = false;
+	{
+		std::scoped_lock lock(m_pageFlipStateMutex);
+		const bool wasCalibration = m_pageFlipConfig.calibrationMode;
+		if (wasCalibration && !normalized.calibrationMode) {
+			calibrationExit = true;
+		}
+		if (!force && normalized == m_pageFlipConfig) {
+			return;
+		}
+
+		m_pageFlipConfig = normalized;
+		UpdatePageFlipLayout();
+		UpdatePageFlipRate();
+		cfg = m_pageFlipConfig;
+	}
+
+	m_pageFlipSerial.Start(cfg, &m_pageFlipLogger, m_pageFlipLocalEmitterSettings.disableAutoConnect);
+	if (cfg.enabled) {
+		EnsurePageFlipThread();
+	} else {
+		m_pageFlipHasFrame = false;
+		StopPageFlipThread();
+	}
+	if (calibrationExit) {
+		m_pageFlipSerial.SetOptDebugLogging(false, GetPageFlipConfigFolder(m_pageFlipConfigPath), nullptr);
+	}
+
+	m_pageFlipLogger.Log(PageFlipLogLevel::Info, L"Pageflip config: enabled={}, rateHz={}, aspect={}, flipEyes={}, overlay={}, comPort='{}'.",
+		cfg.enabled ? 1 : 0,
+		cfg.rateHz,
+		cfg.defaultAspect == PageFlipAspectMode::SideBySide ? L"sbs" : L"tab",
+		cfg.flipEyes ? 1 : 0,
+		cfg.showOverlay ? 1 : 0,
+		cfg.comPort);
+
+	if (m_pFilter) {
+		m_pFilter->UpdateVideoRectForPageFlip();
+		m_pFilter->UpdateVideoSizeForPageFlip();
+		m_pFilter->UpdateRawInputRegistration();
+	}
+}
+
+void CVideoProcessor::SetPageFlipConfig(const PageFlipConfig& config, bool force)
+{
+	ApplyPageFlipConfig(config, force);
+}
+
+PageFlipConfig CVideoProcessor::GetPageFlipConfig() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	return m_pageFlipConfig;
+}
+
+bool CVideoProcessor::IsPageFlipEnabled() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	return m_pageFlipConfig.enabled;
+}
+
+bool CVideoProcessor::ShouldDrawPageFlipCalibrationText() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	return m_pageFlipConfig.enabled && m_pageFlipConfig.calibrationMode;
+}
+
+void CVideoProcessor::SetLocalEmitterSettings(const LocalEmitterSettings& settings, bool persist)
+{
+	m_pageFlipLocalEmitterSettings = settings;
+
+	PageFlipConfig updated;
+	{
+		std::scoped_lock lock(m_pageFlipStateMutex);
+		updated = m_pageFlipConfig;
+		updated.comPort = settings.comPort;
+		m_pageFlipConfig.comPort = settings.comPort;
+	}
+
+	m_pageFlipSerial.SetAutoConnectDisabled(settings.disableAutoConnect);
+	m_pageFlipSerial.UpdateConfig(updated);
+
+	if (persist) {
+		SaveLocalEmitterSettings(m_pageFlipConfigPath, settings);
+	}
+}
+
+bool CVideoProcessor::SetPageFlipEmitterConnected(bool connected)
+{
+	m_pageFlipSerial.SetUserConnected(connected);
+	return m_pageFlipSerial.IsConnected();
+}
+
+bool CVideoProcessor::RefreshPageFlipEmitter(PageFlipEmitterState& state, bool clearDirty)
+{
+	PageFlipConfig updated = GetPageFlipConfig();
+	bool ok = m_pageFlipSerial.ReadEmitterSettings(updated);
+	if (ok) {
+		ApplyPageFlipConfig(updated, true);
+		if (clearDirty) {
+			SetPageFlipEmitterDirty(false);
+		}
+	}
+	state.config = GetPageFlipConfig();
+	state.firmwareVersion = m_pageFlipSerial.GetFirmwareVersion();
+	state.connected = m_pageFlipSerial.IsConnected();
+	return ok;
+}
+
+bool CVideoProcessor::ApplyPageFlipEmitterSettings(const PageFlipConfig& config)
+{
+	PageFlipConfig updated = GetPageFlipConfig();
+	updated.comPort = config.comPort;
+	updated.irDriveMode = config.irDriveMode;
+	updated.irProtocol = config.irProtocol;
+	updated.irFrameDelay = config.irFrameDelay;
+	updated.irFrameDuration = config.irFrameDuration;
+	updated.irSignalSpacing = config.irSignalSpacing;
+	updated.irFlipEyes = config.irFlipEyes;
+	updated.irAverageTimingMode = config.irAverageTimingMode;
+	updated.targetFrametime = config.targetFrametime;
+	updated.optBlockSignalDetectionDelay = config.optBlockSignalDetectionDelay;
+	updated.optIgnoreAllDuplicates = config.optIgnoreAllDuplicates;
+	updated.optSensorFilterMode = config.optSensorFilterMode;
+	updated.optMinThresholdValueToActivate = config.optMinThresholdValueToActivate;
+	updated.optDetectionThresholdHigh = config.optDetectionThresholdHigh;
+	updated.optDetectionThresholdLow = config.optDetectionThresholdLow;
+	updated.optEnableIgnoreDuringIr = config.optEnableIgnoreDuringIr;
+	updated.optEnableDuplicateRealtimeReporting = config.optEnableDuplicateRealtimeReporting;
+	updated.optOutputStats = config.optOutputStats;
+
+	const bool ok = m_pageFlipSerial.ApplyEmitterSettings(updated);
+	if (ok) {
+		ApplyPageFlipConfig(updated, true);
+		SetPageFlipEmitterDirty(true);
+	}
+	return ok;
+}
+
+bool CVideoProcessor::SavePageFlipEmitterSettings()
+{
+	const bool ok = m_pageFlipSerial.SaveEmitterSettingsToEeprom();
+	if (ok) {
+		SetPageFlipEmitterDirty(false);
+	}
+	return ok;
+}
+
+PageFlipEmitterState CVideoProcessor::GetPageFlipEmitterState() const
+{
+	PageFlipEmitterState state = {};
+	state.config = GetPageFlipConfig();
+	state.firmwareVersion = m_pageFlipSerial.GetFirmwareVersion();
+	state.connected = m_pageFlipSerial.IsConnected();
+	return state;
+}
+
+void CVideoProcessor::UpdatePageFlipLayout()
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	m_pageFlipLoggedProcess = false;
+
+	if (!m_pageFlipConfig.enabled || !m_srcRectWidth || !m_srcRectHeight) {
+		m_pageFlipLayout = PageFlipLayout::None;
+		m_pageFlipViewWidth = 0;
+		m_pageFlipViewHeight = 0;
+		m_pageFlipAspectRatioX = 0;
+		m_pageFlipAspectRatioY = 0;
+		return;
+	}
+
+	constexpr double kAspectMatchTolerance = 0.01;
+	auto AspectDiff = [](DWORD aspectX, DWORD aspectY, UINT width, UINT height) -> double {
+		if (!aspectX || !aspectY || !width || !height) {
+			return std::numeric_limits<double>::infinity();
+		}
+		const double left = static_cast<double>(aspectX) * height;
+		const double right = static_cast<double>(aspectY) * width;
+		if (right == 0.0) {
+			return std::numeric_limits<double>::infinity();
+		}
+		return std::abs(left - right) / right;
+	};
+
+	const UINT refWidth = m_srcRectWidth;
+	const UINT refHeight = m_srcRectHeight;
+	const double packedDiff = AspectDiff(m_srcAspectRatioX, m_srcAspectRatioY, refWidth, refHeight);
+	const double eyeSbsDiff = AspectDiff(m_srcAspectRatioX, m_srcAspectRatioY, refWidth / 2, refHeight);
+	const double eyeTabDiff = AspectDiff(m_srcAspectRatioX, m_srcAspectRatioY, refWidth, refHeight / 2);
+	const bool packedAspect = packedDiff <= kAspectMatchTolerance;
+	const bool eyeAspectSbs = eyeSbsDiff <= kAspectMatchTolerance;
+	const bool eyeAspectTab = eyeTabDiff <= kAspectMatchTolerance;
+
+	const double ar = (double)m_srcRectWidth / (double)m_srcRectHeight;
+	if (ar > 2.39) {
+		m_pageFlipLayout = PageFlipLayout::SideBySideFull;
+	} else if (ar < (4.0 / 3.0)) {
+		m_pageFlipLayout = PageFlipLayout::TopAndBottomFull;
+	} else {
+		m_pageFlipLayout = (m_pageFlipConfig.defaultAspect == PageFlipAspectMode::SideBySide)
+			? PageFlipLayout::SideBySideHalf
+			: PageFlipLayout::TopAndBottomHalf;
+	}
+
+	if (m_pageFlipLayout == PageFlipLayout::SideBySideFull || m_pageFlipLayout == PageFlipLayout::SideBySideHalf) {
+		if (m_pageFlipLayout == PageFlipLayout::SideBySideFull) {
+			m_pageFlipViewWidth = std::max(1u, m_srcRectWidth / 2);
+		} else {
+			m_pageFlipViewWidth = std::max(1u, m_srcRectWidth);
+		}
+		m_pageFlipViewHeight = std::max(1u, m_srcRectHeight);
+		m_pageFlipAspectRatioX = m_srcAspectRatioX;
+		m_pageFlipAspectRatioY = m_srcAspectRatioY;
+		if (m_pageFlipLayout == PageFlipLayout::SideBySideFull && (packedAspect || packedDiff <= eyeSbsDiff) && !eyeAspectSbs) {
+			if (m_srcAspectRatioY <= (std::numeric_limits<DWORD>::max)() / 2) {
+				m_pageFlipAspectRatioY = m_srcAspectRatioY * 2;
+			}
+		}
+	} else if (m_pageFlipLayout == PageFlipLayout::TopAndBottomFull || m_pageFlipLayout == PageFlipLayout::TopAndBottomHalf) {
+		m_pageFlipViewWidth = std::max(1u, m_srcRectWidth);
+		if (m_pageFlipLayout == PageFlipLayout::TopAndBottomFull) {
+			m_pageFlipViewHeight = std::max(1u, m_srcRectHeight / 2);
+		} else {
+			m_pageFlipViewHeight = std::max(1u, m_srcRectHeight);
+		}
+		m_pageFlipAspectRatioX = m_srcAspectRatioX;
+		m_pageFlipAspectRatioY = m_srcAspectRatioY;
+		if (m_pageFlipLayout == PageFlipLayout::TopAndBottomFull && (packedAspect || packedDiff <= eyeTabDiff) && !eyeAspectTab) {
+			if (m_srcAspectRatioX <= (std::numeric_limits<DWORD>::max)() / 2) {
+				m_pageFlipAspectRatioX = m_srcAspectRatioX * 2;
+			}
+		}
+	}
+
+	if (m_pageFlipAspectRatioX && m_pageFlipAspectRatioY) {
+		const auto ar_gcd = std::gcd(m_pageFlipAspectRatioX, m_pageFlipAspectRatioY);
+		if (ar_gcd) {
+			m_pageFlipAspectRatioX /= ar_gcd;
+			m_pageFlipAspectRatioY /= ar_gcd;
+		}
+	}
+
+	m_pageFlipLogger.Log(PageFlipLogLevel::Debug,
+		L"Pageflip layout: layout={}, srcRect={}x{}, view={}x{}, srcAR={}:{}, pfAR={}:{}, packedDiff={:.4f}, eyeSbsDiff={:.4f}, eyeTabDiff={:.4f}",
+		static_cast<int>(m_pageFlipLayout),
+		m_srcRectWidth, m_srcRectHeight,
+		m_pageFlipViewWidth, m_pageFlipViewHeight,
+		m_srcAspectRatioX, m_srcAspectRatioY,
+		m_pageFlipAspectRatioX, m_pageFlipAspectRatioY,
+		packedDiff, eyeSbsDiff, eyeTabDiff);
+
+	ResetPageFlipState();
+}
+
+void CVideoProcessor::UpdatePageFlipRate()
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	const double prevRate = m_pageFlipResolvedRateHz;
+	double rate = m_pageFlipConfig.rateHz;
+	if (rate <= 0.0 && m_pFilter && m_pFilter->m_DisplayConfig.refreshRate.Numerator) {
+		rate = (double)m_pFilter->m_DisplayConfig.refreshRate.Numerator
+			/ (double)m_pFilter->m_DisplayConfig.refreshRate.Denominator;
+	}
+	if (rate <= 0.0) {
+		rate = 120.0;
+	}
+
+	m_pageFlipResolvedRateHz = rate;
+	m_pageFlipPeriodTicks = (uint64_t)std::llround(GetPreciseTicksPerSecond() / rate);
+	if (!m_pageFlipPeriodTicks) {
+		m_pageFlipPeriodTicks = 1;
+	}
+	m_pageFlipLateThresholdTicks = (m_pageFlipPeriodTicks * 3) / 2;
+
+	ResetPageFlipState();
+
+	if (m_pageFlipConfig.enabled && (prevRate != m_pageFlipResolvedRateHz)) {
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info, L"Pageflip rate resolved to {:.3f} Hz.", m_pageFlipResolvedRateHz);
+	}
+}
+
+void CVideoProcessor::ResetPageFlipState()
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	m_pageFlipEye = 0;
+	m_pageFlipNextTick = 0;
+	m_pageFlipLastPresentTick = 0;
+	m_pageFlipSkipVBlank = false;
+}
+
+void CVideoProcessor::EnsurePageFlipThread()
+{
+	{
+		std::scoped_lock lock(m_pageFlipStateMutex);
+		if (!m_pageFlipConfig.enabled || m_pageFlipThreadRunning.load()) {
+			return;
+		}
+	}
+
+	m_pageFlipStopRequested = false;
+	m_pageFlipThreadRunning = true;
+	try {
+		m_pageFlipThread = std::thread(&CVideoProcessor::PageFlipThreadProc, this);
+	} catch (...) {
+		m_pageFlipThreadRunning = false;
+		m_pageFlipLogger.Log(PageFlipLogLevel::Error, L"Pageflip: failed to start thread.");
+	}
+}
+
+void CVideoProcessor::StopPageFlipThread()
+{
+	if (!m_pageFlipThreadRunning.load()) {
+		return;
+	}
+
+	m_pageFlipStopRequested = true;
+	if (m_pageFlipWakeEvent) {
+		SetEvent(m_pageFlipWakeEvent);
+	}
+	if (m_pageFlipThread.joinable()) {
+		if (m_pageFlipThread.get_id() == std::this_thread::get_id()) {
+			return;
+		}
+		m_pageFlipThread.join();
+	}
+	m_pageFlipThreadRunning = false;
+	m_pageFlipStopRequested = false;
+}
+
+void CVideoProcessor::PageFlipThreadProc()
+{
+	SetThreadName(DWORD(-1), "PageFlipThread");
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+	const uint64_t ticksPerSecond = GetPreciseTicksPerSecondI();
+
+	for (;;) {
+		if (m_pageFlipStopRequested.load()) {
+			break;
+		}
+
+		PageFlipConfig cfg;
+		PageFlipLayout layout = PageFlipLayout::None;
+		uint64_t periodTicks = 0;
+		uint64_t lateThreshold = 0;
+		uint64_t nextTick = 0;
+		{
+			std::scoped_lock lock(m_pageFlipStateMutex);
+			cfg = m_pageFlipConfig;
+			layout = m_pageFlipLayout;
+			periodTicks = m_pageFlipPeriodTicks;
+			lateThreshold = m_pageFlipLateThresholdTicks;
+			nextTick = m_pageFlipNextTick;
+		}
+
+		if (!cfg.enabled || layout == PageFlipLayout::None || !m_pageFlipHasFrame.load()) {
+			if (m_pageFlipWakeEvent) {
+				WaitForSingleObject(m_pageFlipWakeEvent, 10);
+			} else {
+				Sleep(10);
+			}
+			continue;
+		}
+
+		const uint64_t now = GetPreciseTick();
+		if (!nextTick) {
+			nextTick = now + periodTicks;
+			{
+				std::scoped_lock lock(m_pageFlipStateMutex);
+				m_pageFlipNextTick = nextTick;
+			}
+		}
+
+		if (now < nextTick) {
+			uint64_t waitTicks = nextTick - now;
+			DWORD waitMs = (DWORD)std::clamp<uint64_t>(waitTicks * 1000 / ticksPerSecond, 1, 50);
+			{
+				std::scoped_lock lock(m_pageFlipStateMutex);
+				m_pageFlipNextTick = nextTick;
+			}
+			if (m_pageFlipWakeEvent) {
+				WaitForSingleObject(m_pageFlipWakeEvent, waitMs);
+			} else {
+				Sleep(waitMs);
+			}
+			continue;
+		}
+
+		bool late = false;
+		const uint64_t last = m_pageFlipLastPresentTick.load();
+		if (last && (now - last) > lateThreshold) {
+			late = true;
+		}
+
+		const int eyeValue = m_pageFlipEye.load();
+		const PageFlipEye eye = static_cast<PageFlipEye>(eyeValue);
+
+		bool waited = WaitForVBlank();
+		m_pageFlipSkipVBlank = waited;
+		m_pageFlipSerial.QueueSignal(eye);
+
+		{
+			CAutoLock cRendererLock(&m_pFilter->m_RendererLock);
+			if (m_pFilter->m_filterState != State_Stopped && m_pFilter->m_bValidBuffer) {
+				Render(0, INVALID_TIME);
+			}
+		}
+
+		m_pageFlipSkipVBlank = false;
+		m_pageFlipLastPresentTick = GetPreciseTick();
+
+		if (!late) {
+			m_pageFlipEye.store(eyeValue ? 0 : 1);
+		}
+
+		if (late) {
+			nextTick = now + periodTicks;
+		} else {
+			nextTick += periodTicks;
+		}
+
+		{
+			std::scoped_lock lock(m_pageFlipStateMutex);
+			m_pageFlipNextTick = nextTick;
+		}
+	}
+
+	m_pageFlipThreadRunning = false;
+}
+
+bool CVideoProcessor::GetPageFlipSrcRect(const CRect& srcRect, CRect& outRect) const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.enabled || m_pageFlipLayout == PageFlipLayout::None) {
+		return false;
+	}
+
+	outRect = srcRect;
+
+	const int width = outRect.Width();
+	const int height = outRect.Height();
+	int eye = m_pageFlipEye.load();
+	if (m_pageFlipConfig.flipEyes) {
+		eye = eye ? 0 : 1;
+	}
+
+	if (m_pageFlipLayout == PageFlipLayout::SideBySideFull || m_pageFlipLayout == PageFlipLayout::SideBySideHalf) {
+		const int half = width / 2;
+		if (eye == 0) {
+			outRect.right = outRect.left + half;
+		} else {
+			outRect.left = outRect.right - half;
+		}
+		return true;
+	}
+
+	if (m_pageFlipLayout == PageFlipLayout::TopAndBottomFull || m_pageFlipLayout == PageFlipLayout::TopAndBottomHalf) {
+		const int half = height / 2;
+		if (eye == 0) {
+			outRect.bottom = outRect.top + half;
+		} else {
+			outRect.top = outRect.bottom - half;
+		}
+		return true;
+	}
+
+	return false;
+}
+
+bool CVideoProcessor::GetPageFlipDstRect(const CRect& dstRect, CRect& outRect) const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.enabled || m_pageFlipLayout == PageFlipLayout::None) {
+		return false;
+	}
+
+	outRect = dstRect;
+	const int width = outRect.Width();
+	if (width <= 0) {
+		return false;
+	}
+
+	const double parallaxPct = m_pageFlipConfig.displayParallax;
+	if (parallaxPct == 0.0) {
+		return false;
+	}
+
+	const int offset = (int)std::lround((width * parallaxPct) / 100.0);
+	if (!offset) {
+		return false;
+	}
+	if (std::abs(offset) > (width / 4)) {
+		return false;
+	}
+
+	int eye = m_pageFlipEye.load();
+	if (m_pageFlipConfig.flipEyes) {
+		eye = eye ? 0 : 1;
+	}
+
+	const int eyeOffset = (eye == 0) ? -offset : offset;
+	outRect.OffsetRect(eyeOffset, 0);
+	return true;
+}
+
+std::wstring CVideoProcessor::GetPageFlipStatusText() const
+{
+	if (!ShouldDrawPageFlipStatusText()) {
+		return {};
+	}
+
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	const bool messageActive = IsPageFlipSerialMessageActive();
+	if (!m_pageFlipConfig.showOverlay && messageActive) {
+		return m_pageFlipSerialMessage;
+	}
+
+	const wchar_t* layout = L"none";
+	switch (m_pageFlipLayout) {
+	case PageFlipLayout::SideBySideFull: layout = L"sbs-full"; break;
+	case PageFlipLayout::SideBySideHalf: layout = L"sbs-half"; break;
+	case PageFlipLayout::TopAndBottomFull: layout = L"tab-full"; break;
+	case PageFlipLayout::TopAndBottomHalf: layout = L"tab-half"; break;
+	default: break;
+	}
+
+	int eye = m_pageFlipEye.load();
+	if (m_pageFlipConfig.flipEyes) {
+		eye = eye ? 0 : 1;
+	}
+	const wchar_t* eyeStr = eye ? L"R" : L"L";
+
+	const wchar_t* rateMode = (m_pageFlipConfig.rateHz <= 0.0) ? L"auto" : L"fixed";
+	const std::wstring comPort = m_pageFlipConfig.comPort.empty() ? L"auto" : m_pageFlipConfig.comPort;
+
+	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	const wchar_t* driveMode = (driveModeValue == 1) ? L"serial" : L"optical";
+
+	std::wstring text = std::format(L"Pageflip: {} {} {:.3f} Hz {} drive={} COM={} zoom={}% par={:.3g}%",
+		eyeStr,
+		layout,
+		m_pageFlipResolvedRateHz,
+		rateMode,
+		driveMode,
+		comPort,
+		m_pageFlipConfig.displayZoomFactor,
+		m_pageFlipConfig.displayParallax);
+
+	if (m_pageFlipConfig.flipEyes) {
+		text.append(L" flip");
+	}
+
+	if (m_pageFlipConfig.calibrationMode) {
+		text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes");
+	} else {
+		text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
+	}
+	if (messageActive && !m_pageFlipSerialMessage.empty()) {
+		text.append(L"\n").append(m_pageFlipSerialMessage);
+	}
+	if (IsPageFlipEmitterDirty()) {
+		text.append(L"\nEmitter settings not saved to EEPROM");
+	}
+
+	const int inputW = static_cast<int>(m_srcWidth);
+	const int inputH = static_cast<int>(m_srcHeight);
+	const int videoW = std::max(0, m_videoRect.Width());
+	const int videoH = std::max(0, m_videoRect.Height());
+	const int renderW = std::max(0, m_renderRect.Width());
+	const int renderH = std::max(0, m_renderRect.Height());
+
+	text.append(std::format(L"\nIn {}x{}  Vid {}x{}  Ren {}x{}", inputW, inputH, videoW, videoH, renderW, renderH));
+	text.append(std::format(L"\nSrcRect {}x{}  SrcAR {}:{}  PFAR {}:{}",
+		m_srcRectWidth, m_srcRectHeight,
+		m_srcAspectRatioX, m_srcAspectRatioY,
+		m_pageFlipAspectRatioX, m_pageFlipAspectRatioY));
+
+	return text;
+}
+
+std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
+{
+	if (!ShouldDrawPageFlipCalibrationText()) {
+		return {};
+	}
+
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	std::wstring text;
+	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	const bool serialMode = driveModeValue == 1;
+	const uint64_t now = GetPreciseTick();
+	const uint64_t showWindow = GetPreciseTicksPerSecondI() * 2;
+	if (!m_pageFlipCalibrationMessage.empty()
+		&& (now - m_pageFlipCalibrationMessageTick) < showWindow) {
+		text.append(m_pageFlipCalibrationMessage);
+	}
+	if (m_pageFlipShowCalibrationHelp) {
+		if (!text.empty()) {
+			text.append(L"\n");
+		}
+		if (serialMode) {
+			text.append(L"Cal: I/K frame delay (us)  O/L frame duration (us)");
+			text.append(L"\nShift=big  G=help  T=drive mode");
+		} else {
+			text.append(L"Cal: W/S move up/down  A/D move left/right");
+			text.append(L"\nQ/E spacing  Z/X size  N/M border");
+			text.append(L"\nI/K frame delay (us)  O/L frame duration (us)");
+			text.append(L"\nShift=big  G=help  P=opt debug log  T=drive mode");
+		}
+		text.append(std::format(L"\nDrive mode: {}", serialMode ? L"serial" : L"optical"));
+		if (m_pageFlipConfig.calibrationMode) {
+			text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes");
+		} else {
+			text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
+		}
+	 }
+
+	if (!text.empty()) {
+		text.append(L"\n");
+	}
+	if (serialMode) {
+		text.append(L"Opt debug logging: N/A (serial mode)");
+	} else {
+		const bool optLogging = m_pageFlipSerial.IsOptDebugLogging();
+		text.append(std::format(L"Opt debug logging: {}", optLogging ? L"ON" : L"OFF"));
+	}
+	if (IsPageFlipEmitterDirty()) {
+		text.append(L"\nEmitter settings not saved to EEPROM");
+	}
+
+	return text;
+}
+
+bool CVideoProcessor::CalcPageFlipOverlayLayout(const SIZE& renderSize, PageFlipOverlayLayout& layout) const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	layout = {};
+	if (!ShouldDrawPageFlipBoxes()) {
+		return false;
+	}
+	if (renderSize.cx <= 0 || renderSize.cy <= 0) {
+		return false;
+	}
+
+	const int displaySize = std::max(1, m_pageFlipConfig.displaySizeInches);
+	const double pixelPitchX = renderSize.cx / (displaySize * 0.87 * 25.4);
+	const double pixelPitchY = renderSize.cy / (displaySize * 0.49 * 25.4);
+	if (pixelPitchX <= 0.0 || pixelPitchY <= 0.0) {
+		return false;
+	}
+
+	const int border = m_pageFlipConfig.blackboxBorder;
+	const int spacing = m_pageFlipConfig.whiteboxHorizontalSpacing;
+	const int whiteSize = m_pageFlipConfig.whiteboxSize;
+	const int vertPos = m_pageFlipConfig.whiteboxVerticalPosition;
+	const int horizPos = m_pageFlipConfig.whiteboxHorizontalPosition;
+
+	const int blackboxWidthBase = std::max(1, (int)std::lround((whiteSize + spacing + border + border) * pixelPitchX));
+	const int blackboxHeightBase = std::max(1, (int)std::lround((vertPos + whiteSize + border) * pixelPitchY));
+
+	int blackboxWidth = blackboxWidthBase;
+	int blackboxHeight = blackboxHeightBase;
+	const bool calibration = m_pageFlipConfig.calibrationMode;
+
+	const int whiteW = std::max(1, (int)std::lround(whiteSize * pixelPitchX));
+	const int whiteH = std::max(1, (int)std::lround(whiteSize * pixelPitchY));
+	const int offset1 = (int)std::lround(border * pixelPitchX);
+	const int offset2 = (int)std::lround((border + spacing) * pixelPitchX);
+	const int vertOffset = (int)std::lround(vertPos * pixelPitchY);
+	const double blackboxPosX = (horizPos - border) * pixelPitchX;
+
+	const bool isTop = m_pageFlipConfig.whiteboxCorner == PageFlipCornerPosition::TopLeft
+		|| m_pageFlipConfig.whiteboxCorner == PageFlipCornerPosition::TopRight;
+	const bool isLeft = m_pageFlipConfig.whiteboxCorner == PageFlipCornerPosition::TopLeft
+		|| m_pageFlipConfig.whiteboxCorner == PageFlipCornerPosition::BottomLeft;
+
+	const int baseX = isLeft
+		? (int)std::lround(blackboxPosX)
+		: renderSize.cx - (int)std::lround(blackboxPosX) - blackboxWidth;
+	const int baseY = isTop ? 0 : (renderSize.cy - blackboxHeight);
+
+	const int rightEdge = baseX + blackboxWidth;
+	const int whiteTop = isTop
+		? baseY + vertOffset
+		: baseY + blackboxHeight - whiteH - vertOffset;
+
+	const int whiteLeft1 = isLeft
+		? baseX + offset1
+		: rightEdge - offset1 - whiteW;
+	const int whiteLeft2 = isLeft
+		? baseX + offset2
+		: rightEdge - offset2 - whiteW;
+
+	layout.black = { baseX, baseY, baseX + blackboxWidth, baseY + blackboxHeight };
+	layout.whiteLeft = { whiteLeft1, whiteTop, whiteLeft1 + whiteW, whiteTop + whiteH };
+	layout.whiteRight = { whiteLeft2, whiteTop, whiteLeft2 + whiteW, whiteTop + whiteH };
+	layout.showBoxes = true;
+
+	if (calibration) {
+		const int calibBorder = 40;
+		const int extraX = (int)std::lround(calibBorder * pixelPitchX);
+		const int extraY = (int)std::lround(calibBorder * pixelPitchY);
+		const int extraLeft = extraX / 2;
+		const int extraRight = extraX - extraLeft;
+		const int extraTop = extraY / 2;
+		const int extraBottom = extraY - extraTop;
+		layout.calibrationBlack = {
+			baseX - extraLeft,
+			baseY - extraTop,
+			baseX + blackboxWidth + extraRight,
+			baseY + blackboxHeight + extraBottom
+		};
+		layout.showCalibration = true;
+
+		const int centerX = (whiteLeft1 + whiteLeft2 + whiteW) / 2;
+		const int centerY = whiteTop + whiteH / 2;
+		const int thickness = 1;
+		layout.reticleH = { layout.calibrationBlack.left, centerY, layout.calibrationBlack.right, centerY + thickness };
+		layout.reticleV = { centerX, layout.calibrationBlack.top, centerX + thickness, layout.calibrationBlack.bottom };
+		layout.showReticle = true;
+	}
+
+	return true;
+}
+
+bool CVideoProcessor::ShouldDrawPageFlipBoxes() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.enabled) {
+		return false;
+	}
+
+	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	if (driveModeValue != 0) {
+		return false;
+	}
+	return true;
+}
+
+bool CVideoProcessor::ShouldDrawPageFlipStatusText() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.enabled) {
+		return false;
+	}
+	return m_pageFlipConfig.showOverlay || IsPageFlipSerialMessageActive();
+}
+
+void CVideoProcessor::OnPageFlipSampleReceived()
+{
+	m_pageFlipHasFrame = true;
+	if (m_pageFlipWakeEvent) {
+		SetEvent(m_pageFlipWakeEvent);
+	}
+	EnsurePageFlipThread();
+}
+
+void CVideoProcessor::UpdatePageFlipSerialStatus()
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.enabled) {
+		m_pageFlipSerialWasConnected = false;
+		m_pageFlipSerialMessage.clear();
+		return;
+	}
+
+	const bool connected = m_pageFlipSerial.IsConnected();
+	if (connected) {
+		m_pageFlipSerialWasConnected = true;
+		m_pageFlipSerialMessage.clear();
+		return;
+	}
+
+	if (m_pageFlipSerialWasConnected && !connected) {
+		m_pageFlipSerialWasConnected = false;
+		m_pageFlipSerialMessage = L"Serial connection lost";
+		m_pageFlipSerialMessageTick = GetPreciseTick();
+	}
+}
+
+bool CVideoProcessor::IsPageFlipSerialMessageActive() const
+{
+	std::scoped_lock lock(m_pageFlipStateMutex);
+	if (m_pageFlipSerialMessage.empty()) {
+		return false;
+	}
+	const uint64_t now = GetPreciseTick();
+	const uint64_t window = GetPreciseTicksPerSecondI() * 2;
+	return (now - m_pageFlipSerialMessageTick) < window;
+}
+
+bool CVideoProcessor::HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) {
+		return false;
+	}
+	std::unique_lock lock(m_pageFlipStateMutex);
+	if (!m_pageFlipConfig.calibrationMode) {
+		return false;
+	}
+
+	UNREFERENCED_PARAMETER(lParam);
+
+	const int key = (int)wParam;
+	const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	const bool serialMode = driveModeValue == 1;
+
+	PageFlipConfig updated = m_pageFlipConfig;
+	bool changed = false;
+	bool displayChanged = false;
+	bool emitterChanged = false;
+
+	auto setMessage = [&](const std::wstring& label, int value) {
+		m_pageFlipCalibrationMessage = std::format(L"{}: {}", label, value);
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+	};
+
+	const bool isTop = updated.whiteboxCorner == PageFlipCornerPosition::TopLeft
+		|| updated.whiteboxCorner == PageFlipCornerPosition::TopRight;
+	const bool isLeft = updated.whiteboxCorner == PageFlipCornerPosition::TopLeft
+		|| updated.whiteboxCorner == PageFlipCornerPosition::BottomLeft;
+
+	switch (key) {
+	case 'G':
+		m_pageFlipShowCalibrationHelp = !m_pageFlipShowCalibrationHelp;
+		m_pageFlipCalibrationMessage = m_pageFlipShowCalibrationHelp ? L"calibration help on" : L"calibration help off";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		return true;
+	case 'P': {
+		if (serialMode) {
+			m_pageFlipCalibrationMessage = L"opt debug logging unavailable in serial mode";
+			m_pageFlipCalibrationMessageTick = GetPreciseTick();
+			return true;
+		}
+		if (!m_pageFlipSerial.IsConnected()) {
+			m_pageFlipCalibrationMessage = L"opt debug logging requires emitter connection";
+			m_pageFlipCalibrationMessageTick = GetPreciseTick();
+			return true;
+		}
+		const bool enable = !m_pageFlipSerial.IsOptDebugLogging();
+		std::wstring logPath;
+		const bool ok = m_pageFlipSerial.SetOptDebugLogging(enable, GetPageFlipConfigFolder(m_pageFlipConfigPath), &logPath);
+		if (ok) {
+			m_pageFlipCalibrationMessage = enable ? L"opt debug logging on" : L"opt debug logging off";
+		} else {
+			m_pageFlipCalibrationMessage = L"opt debug logging failed";
+		}
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		return true;
+	}
+	case 'C':
+		updated.calibrationMode = !updated.calibrationMode;
+		m_pageFlipCalibrationMessage = updated.calibrationMode ? L"calibration mode on" : L"calibration mode off";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		changed = true;
+		displayChanged = true;
+		break;
+	case 'T':
+		if (!m_pageFlipSerial.IsConnected()) {
+			m_pageFlipCalibrationMessage = L"drive mode toggle requires emitter connection";
+			m_pageFlipCalibrationMessageTick = GetPreciseTick();
+			return true;
+		}
+		updated.irDriveMode = (updated.irDriveMode == 1) ? 0 : 1;
+		m_pageFlipCalibrationMessage = updated.irDriveMode == 1 ? L"drive mode: serial" : L"drive mode: optical";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		changed = true;
+		displayChanged = true;
+		emitterChanged = true;
+		break;
+	case 'W':
+	case 'S': {
+		if (serialMode) {
+			return false;
+		}
+		const int step = shiftDown ? 10 : 1;
+		const bool decrease = (key == 'W') ? isTop : !isTop;
+		updated.whiteboxVerticalPosition += decrease ? -step : step;
+		setMessage(L"whitebox_vertical_position", updated.whiteboxVerticalPosition);
+		changed = true;
+		displayChanged = true;
+		break;
+	}
+	case 'A':
+	case 'D': {
+		if (serialMode) {
+			return false;
+		}
+		const int step = shiftDown ? 10 : 1;
+		const bool decrease = (key == 'A') ? isLeft : !isLeft;
+		updated.whiteboxHorizontalPosition += decrease ? -step : step;
+		setMessage(L"whitebox_horizontal_position", updated.whiteboxHorizontalPosition);
+		changed = true;
+		displayChanged = true;
+		break;
+	}
+	case 'Q':
+	case 'E': {
+		if (serialMode) {
+			return false;
+		}
+		const int step = shiftDown ? 5 : 1;
+		updated.whiteboxHorizontalSpacing = std::max(0, updated.whiteboxHorizontalSpacing + (key == 'Q' ? -step : step));
+		setMessage(L"whitebox_horizontal_spacing", updated.whiteboxHorizontalSpacing);
+		changed = true;
+		displayChanged = true;
+		break;
+	}
+	case 'N':
+	case 'M': {
+		if (serialMode) {
+			return false;
+		}
+		const int step = shiftDown ? 5 : 1;
+		updated.blackboxBorder = std::max(0, updated.blackboxBorder + (key == 'N' ? -step : step));
+		setMessage(L"blackbox_border", updated.blackboxBorder);
+		changed = true;
+		displayChanged = true;
+		break;
+	}
+	case 'Z':
+	case 'X': {
+		if (serialMode) {
+			return false;
+		}
+		const int step = shiftDown ? 10 : 1;
+		updated.whiteboxSize = std::max(1, updated.whiteboxSize + (key == 'Z' ? -step : step));
+		setMessage(L"whitebox_size", updated.whiteboxSize);
+		changed = true;
+		displayChanged = true;
+		break;
+	}
+	case 'I':
+	case 'K': {
+		const int step = shiftDown ? 200 : 10;
+		updated.irFrameDelay = std::max(0, updated.irFrameDelay + (key == 'I' ? -step : step));
+		setMessage(L"frame_delay", updated.irFrameDelay);
+		changed = true;
+		emitterChanged = true;
+		break;
+	}
+	case 'O':
+	case 'L': {
+		const int step = shiftDown ? 200 : 10;
+		updated.irFrameDuration = std::max(0, updated.irFrameDuration + (key == 'O' ? -step : step));
+		setMessage(L"frame_duration", updated.irFrameDuration);
+		changed = true;
+		emitterChanged = true;
+		break;
+	}
+	default:
+		return false;
+	}
+
+	if (!changed) {
+		return false;
+	}
+
+	lock.unlock();
+
+	ApplyPageFlipConfig(updated, true);
+
+	if (displayChanged) {
+		SavePageFlipConfig(m_pageFlipConfigPath, updated);
+	}
+
+	if (emitterChanged && m_pageFlipSerial.IsConnected()) {
+		if (m_pageFlipSerial.ApplyEmitterSettings(updated)) {
+			SetPageFlipEmitterDirty(true);
+		}
+	}
+
+	return true;
+}
+
+bool CVideoProcessor::HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM lParam, const wchar_t* source)
+{
+	if (uMsg != WM_KEYDOWN && uMsg != WM_SYSKEYDOWN) {
+		return false;
+	}
+
+	const int key = (int)wParam;
+	const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+	const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	const PageFlipConfig cfg = GetPageFlipConfig();
+	const int calibration = cfg.calibrationMode ? 1 : 0;
+	const int enabled = cfg.enabled ? 1 : 0;
+	const int driveMode = cfg.irDriveMode;
+	m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+		L"Pageflip key msg: source={} key={} calibration={} enabled={} drive={}",
+		source ? source : L"unknown", key, calibration, enabled, driveMode);
+
+	if (key == VK_F10 && ctrlDown && shiftDown) {
+		PageFlipConfig updated = m_pageFlipConfig;
+		updated.calibrationMode = !updated.calibrationMode;
+		m_pageFlipCalibrationMessage = updated.calibrationMode ? L"calibration mode on" : L"calibration mode off";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		ApplyPageFlipConfig(updated, true);
+		SavePageFlipConfig(m_pageFlipConfigPath, updated);
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+			L"Pageflip key handled: source={} key={} handled=1",
+			source ? source : L"unknown", key);
+		return true;
+	}
+	if (key == VK_F12 && ctrlDown && shiftDown) {
+		PageFlipConfig updated = m_pageFlipConfig;
+		updated.flipEyes = !updated.flipEyes;
+		m_pageFlipCalibrationMessage = updated.flipEyes ? L"flip eyes on" : L"flip eyes off";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		ApplyPageFlipConfig(updated, true);
+		SavePageFlipConfig(m_pageFlipConfigPath, updated);
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+			L"Pageflip key handled: source={} key={} handled=1",
+			source ? source : L"unknown", key);
+		return true;
+	}
+	if (key == VK_F8 && ctrlDown && shiftDown) {
+		PageFlipConfig updated = m_pageFlipConfig;
+		updated.enabled = !updated.enabled;
+		m_pageFlipCalibrationMessage = updated.enabled ? L"pageflip enabled" : L"pageflip disabled";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		ApplyPageFlipConfig(updated, true);
+		SavePageFlipConfig(m_pageFlipConfigPath, updated);
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+			L"Pageflip key handled: source={} key={} handled=1",
+			source ? source : L"unknown", key);
+		return true;
+	}
+	if (key == VK_F9 && ctrlDown && shiftDown) {
+		PageFlipConfig updated = m_pageFlipConfig;
+		updated.showOverlay = !updated.showOverlay;
+		m_pageFlipCalibrationMessage = updated.showOverlay ? L"osd on" : L"osd off";
+		m_pageFlipCalibrationMessageTick = GetPreciseTick();
+		ApplyPageFlipConfig(updated, true);
+		SavePageFlipConfig(m_pageFlipConfigPath, updated);
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+			L"Pageflip key handled: source={} key={} handled=1",
+			source ? source : L"unknown", key);
+		return true;
+	}
+	if (key == VK_F11 && ctrlDown && shiftDown) {
+		if (!cfg.calibrationMode && m_pFilter) {
+			m_pFilter->ShowPropertyPages();
+			m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+				L"Pageflip key handled: source={} key={} handled=1",
+				source ? source : L"unknown", key);
+			return true;
+		}
+	}
+
+	const bool handled = HandlePageFlipKey(uMsg, wParam, lParam);
+	m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+		L"Pageflip key handled: source={} key={} handled={}",
+		source ? source : L"unknown", key, handled ? 1 : 0);
+
+	UNREFERENCED_PARAMETER(lParam);
+	return handled;
 }
 
 void CVideoProcessor::UpdateStatsByWindow()
@@ -175,6 +1297,8 @@ void CVideoProcessor::SetDisplayInfo(const DisplayConfig_t& dc, const bool prima
 	if (str.size()) {
 		m_strStatsDispInfo.append(str);
 	}
+
+	UpdatePageFlipRate();
 }
 
 void CVideoProcessor::UpdateStatsInputFmt()

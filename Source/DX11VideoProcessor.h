@@ -150,6 +150,11 @@ private:
 	CD3D11Rectangle m_Underlay;
 	CD3D11Lines     m_Lines;
 	CD3D11Polyline  m_SyncLine;
+	CD3D11Rectangle m_PageFlipBlack;
+	CD3D11Rectangle m_PageFlipWhiteLeft;
+	CD3D11Rectangle m_PageFlipWhiteRight;
+	CD3D11Rectangle m_PageFlipReticleH;
+	CD3D11Rectangle m_PageFlipReticleV;
 
 	bool m_bExclusiveScreen = false;
 	bool m_bFullScreen = false;
@@ -197,6 +202,7 @@ private:
 	bool m_bHDRModeChangeOutside = false;
 
 	void FillDisplayParams();
+	bool WaitForVBlank() override;
 
 public:
 	CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Settings_t& config, HRESULT& hr);
@@ -315,6 +321,7 @@ private:
 	void UpdateStatsStatic();
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(ID3D11Texture2D* pRenderTarget);
+	HRESULT DrawPageFlipOverlay(ID3D11Texture2D* pRenderTarget);
 
 public:
 	// IMFVideoProcessor

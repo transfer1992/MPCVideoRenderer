@@ -1,4 +1,10 @@
-﻿# MPC Video Renderer
+﻿# Fork Info
+
+This is a forked version MPC Video Renderer that adds support for page flipped 3D video.
+It also supports the Open3DOLED on screen trigger boxes and PC serial sync protocol.
+Releases will be built and released on the main open3doled repository releases page https://github.com/open3doled/open-3d-oled/releases.
+
+# MPC Video Renderer
 
 MPC Video Renderer is a free and open-source video renderer for DirectShow. The renderer can potentially work with any DirectShow player, but full support is available only in the MPC-BE. Recommended MPC-BE 1.8.2.136 or newer.
 

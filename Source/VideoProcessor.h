@@ -21,8 +21,12 @@
 #pragma once
 
 #include <evr9.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include "DisplayConfig.h"
 #include "FrameStats.h"
+#include "PageFlip.h"
 #include "SubPic/ISubPic.h"
 
 enum : int {
@@ -125,6 +129,44 @@ protected:
 
 	bool m_bAllowDeepColorBitmaps = false;
 
+	// PageFlip
+	PageFlipConfig m_pageFlipConfig;
+	PageFlipLayout m_pageFlipLayout = PageFlipLayout::None;
+	mutable std::recursive_mutex m_pageFlipStateMutex;
+	std::atomic<int> m_pageFlipEye = 0;
+	UINT m_pageFlipViewWidth = 0;
+	UINT m_pageFlipViewHeight = 0;
+	DWORD m_pageFlipAspectRatioX = 0;
+	DWORD m_pageFlipAspectRatioY = 0;
+	double m_pageFlipResolvedRateHz = 0.0;
+	uint64_t m_pageFlipPeriodTicks = 0;
+	uint64_t m_pageFlipNextTick = 0;
+	std::atomic<uint64_t> m_pageFlipLastPresentTick = 0;
+	uint64_t m_pageFlipLateThresholdTicks = 0;
+	std::atomic_bool m_pageFlipSkipVBlank = false;
+	std::atomic_bool m_pageFlipHasFrame = false;
+
+	std::atomic_bool m_pageFlipThreadRunning = false;
+	std::atomic_bool m_pageFlipStopRequested = false;
+	HANDLE m_pageFlipWakeEvent = nullptr;
+	std::thread m_pageFlipThread;
+
+	std::wstring m_pageFlipConfigPath;
+	std::wstring m_pageFlipLogPath;
+	std::wstring m_pageFlipLocalEmitterPath;
+
+	PageFlipLogger m_pageFlipLogger;
+	PageFlipSerial m_pageFlipSerial;
+	LocalEmitterSettings m_pageFlipLocalEmitterSettings;
+	std::atomic<bool> m_pageFlipEmitterDirty = false;
+	bool m_pageFlipShowCalibrationHelp = true;
+	std::wstring m_pageFlipCalibrationMessage;
+	uint64_t m_pageFlipCalibrationMessageTick = 0;
+	bool m_pageFlipLoggedProcess = false;
+	bool m_pageFlipSerialWasConnected = false;
+	std::wstring m_pageFlipSerialMessage;
+	uint64_t m_pageFlipSerialMessageTick = 0;
+
 	// AlphaBitmap
 	bool m_bAlphaBitmapEnable = false;
 	RECT m_AlphaBitmapRectSrc = {};
@@ -158,10 +200,46 @@ protected:
 
 	int m_nStereoSubtitlesOffsetInPixels = 4;
 
-	CVideoProcessor(CMpcVideoRenderer* pFilter) : m_pFilter(pFilter) {}
+	CVideoProcessor(CMpcVideoRenderer* pFilter) : m_pFilter(pFilter) { InitPageFlip(); }
+	void InitPageFlip();
+	void ApplyPageFlipConfig(const PageFlipConfig& config, bool force);
+	void UpdatePageFlipLayout();
+	void UpdatePageFlipRate();
+	void ResetPageFlipState();
+	void EnsurePageFlipThread();
+	void StopPageFlipThread();
+	void PageFlipThreadProc();
+	void UpdatePageFlipSerialStatus();
+	bool IsPageFlipSerialMessageActive() const;
+	bool GetPageFlipSrcRect(const CRect& srcRect, CRect& outRect) const;
+	bool GetPageFlipDstRect(const CRect& dstRect, CRect& outRect) const;
+	bool IsPageFlipEnabled() const;
+	bool UsePageFlipThread() const { return m_pageFlipThreadRunning.load(); }
+	bool ShouldSkipVBlank() const { return m_pageFlipSkipVBlank.load(); }
+	bool ShouldDrawPageFlipOverlay() const { return ShouldDrawPageFlipBoxes() || ShouldDrawPageFlipStatusText() || ShouldDrawPageFlipCalibrationText(); }
+	bool ShouldDrawPageFlipBoxes() const;
+	bool ShouldDrawPageFlipStatusText() const;
+	bool ShouldDrawPageFlipCalibrationText() const;
+	std::wstring GetPageFlipStatusText() const;
+	std::wstring GetPageFlipCalibrationText() const;
+	void OnPageFlipSampleReceived();
+	virtual bool WaitForVBlank() { return false; }
+
+	struct PageFlipOverlayLayout {
+		RECT black = {};
+		RECT calibrationBlack = {};
+		RECT whiteLeft = {};
+		RECT whiteRight = {};
+		RECT reticleH = {};
+		RECT reticleV = {};
+		bool showBoxes = false;
+		bool showCalibration = false;
+		bool showReticle = false;
+	};
+	bool CalcPageFlipOverlayLayout(const SIZE& renderSize, PageFlipOverlayLayout& layout) const;
 
 public:
-	virtual ~CVideoProcessor() = default;
+	virtual ~CVideoProcessor();
 
 	virtual int Type() = 0;
 
@@ -205,6 +283,20 @@ public:
 	void SetFlip(bool value) { m_bFlip = value; }
 	virtual void SetStereo3dTransform(int value) {};
 	void SetAllowDeepColorBitmaps(bool value) { m_bAllowDeepColorBitmaps = value; }
+	PageFlipConfig GetPageFlipConfig() const;
+	void SetPageFlipConfig(const PageFlipConfig& config, bool force);
+	void ReloadPageFlipConfig(bool force = false);
+	LocalEmitterSettings GetLocalEmitterSettings() const { return m_pageFlipLocalEmitterSettings; }
+	void SetLocalEmitterSettings(const LocalEmitterSettings& settings, bool persist);
+	bool SetPageFlipEmitterConnected(bool connected);
+	bool RefreshPageFlipEmitter(PageFlipEmitterState& state, bool clearDirty);
+	PageFlipEmitterState GetPageFlipEmitterState() const;
+	bool ApplyPageFlipEmitterSettings(const PageFlipConfig& config);
+	bool SavePageFlipEmitterSettings();
+	bool IsPageFlipEmitterDirty() const { return m_pageFlipEmitterDirty.load(); }
+	void SetPageFlipEmitterDirty(bool dirty) { m_pageFlipEmitterDirty.store(dirty); }
+	bool HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam);
+	bool HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM lParam, const wchar_t* source);
 
 	virtual void ClearPreScaleShaders() {};
 	virtual void ClearPostScaleShaders() {};

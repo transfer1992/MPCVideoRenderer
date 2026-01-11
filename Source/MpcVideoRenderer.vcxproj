@@ -50,6 +50,7 @@
       <ModuleDefinitionFile>MpcVideoRenderer.def</ModuleDefinitionFile>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
       <DelayLoadDLLs>d3d9.dll;dxva2.dll;dxgi.dll;d3d11.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalDependencies>comdlg32.lib;setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
       <Command>..\update_revision.cmd</Command>
@@ -77,6 +78,7 @@
     <ClCompile Include="DXVA2VP.cpp" />
     <ClCompile Include="Helper.cpp" />
     <ClCompile Include="MediaSampleSideData.cpp" />
+    <ClCompile Include="PageFlip.cpp" />
     <ClCompile Include="PropPage.cpp" />
     <ClCompile Include="renbase2.cpp" />
     <ClCompile Include="Shaders.cpp" />
@@ -117,6 +119,7 @@
     <ClInclude Include="Helper.h" />
     <ClInclude Include="IVideoRenderer.h" />
     <ClInclude Include="MediaSampleSideData.h" />
+    <ClInclude Include="PageFlip.h" />
     <ClInclude Include="PropPage.h" />
     <ClInclude Include="renbase2.h" />
     <ClInclude Include="resource.h" />
