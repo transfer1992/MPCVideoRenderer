@@ -2316,6 +2316,8 @@ void CVRPageFlipPPage::UpdateTimingWarnings(const PageFlipConfig& cfg)
 {
 	const bool hasTarget = cfg.targetFrametime > 0;
 	const bool avgEnabled = cfg.irAverageTimingMode != 0;
+	const int driveMode = m_connected ? cfg.irDriveMode : 0;
+	const bool showSerialAvgWarn = (driveMode == 1) && !avgEnabled;
 
 	HWND hAvgTiming = GetDlgItem(IDC_EM_AVG_TIMING);
 	if (hAvgTiming) {
@@ -2325,6 +2327,11 @@ void CVRPageFlipPPage::UpdateTimingWarnings(const PageFlipConfig& cfg)
 	HWND hAvgWarn = GetDlgItem(IDC_EM_AVG_REQ_WARN);
 	if (hAvgWarn) {
 		::ShowWindow(hAvgWarn, hasTarget ? SW_HIDE : SW_SHOW);
+	}
+
+	HWND hAvgSerialWarn = GetDlgItem(IDC_EM_AVG_SERIAL_WARN);
+	if (hAvgSerialWarn) {
+		::ShowWindow(hAvgSerialWarn, showSerialAvgWarn ? SW_SHOW : SW_HIDE);
 	}
 
 	const double refreshHz = GetPrimaryDisplayRefreshHz();
@@ -2357,6 +2364,9 @@ void CVRPageFlipPPage::UpdateTimingWarnings(const PageFlipConfig& cfg)
 	}
 	if (hAvgWarn) {
 		::InvalidateRect(hAvgWarn, nullptr, TRUE);
+	}
+	if (hAvgSerialWarn) {
+		::InvalidateRect(hAvgSerialWarn, nullptr, TRUE);
 	}
 }
 
@@ -2460,7 +2470,7 @@ HRESULT CVRPageFlipPPage::OnActivate()
 	AddHint(IDC_EM_FRAME_DURATION, L"(us) Duration to keep glasses active after activation.");
 	AddHint(IDC_EM_SIGNAL_SPACING, L"(us) Delay between IR signals to avoid overloading receiver.");
 	AddHint(IDC_EM_FLIP_EYES, L"Set to 1 to flip left/right eye signals.");
-	AddHint(IDC_EM_AVG_TIMING, L"0=Disable, 1=Mode 1 (averaging to reduce jitter).");
+	AddHint(IDC_EM_AVG_TIMING, L"0=Disable, 1=Mode 1 (averaging to reduce jitter). In PC Serial mode, 1 is recommended for better performance.");
 	AddHint(IDC_EM_TARGET_FRAMETIME, L"(us) Expected frame time (1,000,000 / refresh rate). Used for averaging.");
 	AddHint(IDC_EM_BLOCK_DELAY, L"(us) Block detection after a trigger to avoid false repeats.");
 	AddHint(IDC_EM_IGNORE_ALL, L"Ignore all duplicate detections (0=off, 1=on).");
@@ -2500,6 +2510,12 @@ INT_PTR CVRPageFlipPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, 
 		if (hCtl == GetDlgItem(IDC_EM_AVG_REQ_WARN)) {
 			HDC hdc = (HDC)wParam;
 			SetTextColor(hdc, RGB(0, 0, 0));
+			SetBkMode(hdc, TRANSPARENT);
+			return (INT_PTR)(m_warnBrush ? m_warnBrush : GetSysColorBrush(COLOR_BTNFACE));
+		}
+		if (hCtl == GetDlgItem(IDC_EM_AVG_SERIAL_WARN)) {
+			HDC hdc = (HDC)wParam;
+			SetTextColor(hdc, RGB(200, 0, 0));
 			SetBkMode(hdc, TRANSPARENT);
 			return (INT_PTR)(m_warnBrush ? m_warnBrush : GetSysColorBrush(COLOR_BTNFACE));
 		}
@@ -2691,6 +2707,7 @@ INT_PTR CVRPageFlipPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, 
 						m_cfg.irDriveMode = static_cast<int>(drive);
 					}
 					UpdateModeControls();
+					UpdateTimingWarnings(GetConfigFromControls());
 					m_emitterPending = true;
 					UpdateEmitterDirty();
 					SetDirty();

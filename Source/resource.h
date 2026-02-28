@@ -217,6 +217,7 @@
 #define IDC_EM_AVG_REQ_WARN             1198
 #define IDC_EM_TARGET_WARN              1199
 #define IDC_EM_FW_DISABLED_WARN         1200
+#define IDC_EM_AVG_SERIAL_WARN          1201
 #define IDC_EMFW_MATCH                  1201
 
 // Next default values for new objects
@@ -225,7 +226,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        111
 #define _APS_NEXT_COMMAND_VALUE         40001
-#define _APS_NEXT_CONTROL_VALUE         1197
+#define _APS_NEXT_CONTROL_VALUE         1202
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
