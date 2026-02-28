@@ -217,6 +217,7 @@
 #define IDC_EM_AVG_REQ_WARN             1198
 #define IDC_EM_TARGET_WARN              1199
 #define IDC_EM_FW_DISABLED_WARN         1200
+#define IDC_EMFW_MATCH                  1201
 
 // Next default values for new objects
 // 

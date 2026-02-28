@@ -79,11 +79,13 @@ void ComboBox_SelectByItemData(HWND hWnd, int nIDComboBox, LONG_PTR data)
 }
 
 static bool BrowseOpenFile(HWND hwnd, const wchar_t* filter, const wchar_t* defExt, std::wstring& outPath);
+static std::wstring GetDlgItemTextString(HWND hWnd, int nID);
 
 namespace {
 
 constexpr UINT WM_EMFW_STATUS = WM_APP + 120;
 constexpr UINT WM_EMFW_DONE = WM_APP + 121;
+static std::wstring g_emfwMatchOverride;
 
 static const GUID& GetComPortClassGuid()
 {
@@ -173,7 +175,23 @@ static double GetPrimaryDisplayRefreshHz()
 	return (double)dc.refreshRate.Numerator / (double)dc.refreshRate.Denominator;
 }
 
-static std::wstring DetectBootloaderPort()
+static bool MultiSzContainsNoCase(const wchar_t* multi, const std::wstring& needle)
+{
+	if (!multi || !multi[0] || needle.empty()) {
+		return false;
+	}
+	const wchar_t* cur = multi;
+	while (*cur) {
+		std::wstring entry = cur;
+		if (ContainsNoCase(entry, needle)) {
+			return true;
+		}
+		cur += entry.size() + 1;
+	}
+	return false;
+}
+
+static std::wstring DetectBootloaderPort(const std::wstring& matchOverride)
 {
 	const GUID& guid = GetComPortClassGuid();
 	HDEVINFO devInfo = SetupDiGetClassDevsW(&guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -181,7 +199,9 @@ static std::wstring DetectBootloaderPort()
 		return {};
 	}
 
-	std::wstring selected;
+	std::wstring selectedPreferred;
+	std::wstring selectedFallback;
+	const bool hasOverride = !matchOverride.empty();
 
 	for (DWORD index = 0; ; ++index) {
 		SP_DEVINFO_DATA devData = {};
@@ -203,21 +223,22 @@ static std::wstring DetectBootloaderPort()
 			info = desc;
 		}
 
-		bool match = ContainsNoCase(info, L"arduino leonardo") || ContainsNoCase(info, L"usb serial device");
+		const bool overrideMatch = hasOverride && (ContainsNoCase(info, matchOverride) || MultiSzContainsNoCase(hwid, matchOverride));
+		const bool sparkfunBootMatch = ContainsNoCase(info, L"sparkfun pro micro bootloader")
+			|| MultiSzContainsNoCase(hwid, L"vid_1b4f&pid_9205")
+			|| MultiSzContainsNoCase(hwid, L"1b4f:9205");
+		const bool sparkfunRegularMatch = ContainsNoCase(info, L"sparkfun pro micro")
+			|| MultiSzContainsNoCase(hwid, L"vid_1b4f&pid_9206")
+			|| MultiSzContainsNoCase(hwid, L"1b4f:9206");
+		const bool leonardoMatch = ContainsNoCase(info, L"arduino leonardo")
+			|| MultiSzContainsNoCase(hwid, L"vid_2341&pid_0036")
+			|| MultiSzContainsNoCase(hwid, L"2341:0036");
+		const bool usbSerialFallback = !hasOverride && ContainsNoCase(info, L"usb serial device");
 
-		if (!match && hwid[0]) {
-			const wchar_t* cur = hwid;
-			while (*cur) {
-				std::wstring entry = cur;
-				if (ContainsNoCase(entry, L"vid_2341&pid_0036") || ContainsNoCase(entry, L"2341:0036")) {
-					match = true;
-					break;
-				}
-				cur += entry.size() + 1;
-			}
-		}
+		const bool preferredMatch = overrideMatch || sparkfunBootMatch || leonardoMatch;
+		const bool fallbackMatch = sparkfunRegularMatch || usbSerialFallback;
 
-		if (!match) {
+		if (!preferredMatch && !fallbackMatch) {
 			continue;
 		}
 
@@ -227,16 +248,21 @@ static std::wstring DetectBootloaderPort()
 			DWORD type = 0;
 			DWORD size = sizeof(portName);
 			if (RegQueryValueExW(hKey, L"PortName", nullptr, &type, (LPBYTE)portName, &size) == ERROR_SUCCESS) {
-				selected = portName;
-				RegCloseKey(hKey);
-				break;
+				if (preferredMatch) {
+					selectedPreferred = portName;
+					RegCloseKey(hKey);
+					break;
+				}
+				if (selectedFallback.empty()) {
+					selectedFallback = portName;
+				}
 			}
 			RegCloseKey(hKey);
 		}
 	}
 
 	SetupDiDestroyDeviceInfoList(devInfo);
-	return selected;
+	return !selectedPreferred.empty() ? selectedPreferred : selectedFallback;
 }
 
 struct HexImage {
@@ -872,6 +898,7 @@ private:
 	HWND m_hDlg = nullptr;
 	std::wstring m_firmwarePath;
 	std::wstring m_selectedPort;
+	std::wstring m_matchOverride;
 	std::atomic<bool> m_running = false;
 	std::thread m_worker;
 	std::vector<PageFlipPortInfo> m_ports;
@@ -962,6 +989,9 @@ void EmitterFirmwareDialog::OnInit()
 {
 	PopulatePorts(L"");
 	SetDlgItemTextW(m_hDlg, IDC_EMFW_FILE, L"");
+	SetDlgItemTextW(m_hDlg, IDC_EMFW_MATCH, g_emfwMatchOverride.c_str());
+	AppendStatus(L"Optional match override accepts a friendly-name or VID/PID substring.");
+	AppendStatus(L"Known IDs: regular VID_1B4F&PID_9206, bootloader VID_1B4F&PID_9205.");
 }
 
 void EmitterFirmwareDialog::OnRefreshPorts()
@@ -997,6 +1027,8 @@ void EmitterFirmwareDialog::OnUpdate()
 		AppendStatus(L"Select a serial port first.");
 		return;
 	}
+	m_matchOverride = GetDlgItemTextString(m_hDlg, IDC_EMFW_MATCH);
+	g_emfwMatchOverride = m_matchOverride;
 
 	m_running = true;
 	::EnableWindow(::GetDlgItem(m_hDlg, IDC_EMFW_UPDATE), FALSE);
@@ -1070,6 +1102,9 @@ void EmitterFirmwareDialog::PopulatePorts(const std::wstring& selected)
 			selectedIndex = (int)i + 1;
 		}
 		if (firstMatch.empty() && (ContainsNoCase(m_ports[i].description, L"sparkfun pro micro")
+			|| ContainsNoCase(m_ports[i].description, L"sparkfun pro micro usb")
+			|| ContainsNoCase(m_ports[i].description, L"vid_1b4f&pid_9206")
+			|| ContainsNoCase(m_ports[i].description, L"1b4f:9206")
 			|| ContainsNoCase(m_ports[i].description, L"usb serial device"))) {
 			firstMatch = m_ports[i].port;
 		}
@@ -1116,14 +1151,14 @@ void EmitterFirmwareDialog::WorkerThread()
 	std::wstring bootPort;
 	for (int i = 0; i < 10; ++i) {
 		Sleep(500);
-		bootPort = DetectBootloaderPort();
+		bootPort = DetectBootloaderPort(m_matchOverride);
 		if (!bootPort.empty()) {
 			break;
 		}
 	}
 
 	if (bootPort.empty()) {
-		PostStatus(L"Failed to enter bootloader (Arduino Leonardo not found).");
+		PostStatus(L"Failed to enter bootloader (no matching bootloader device found).");
 		PostMessageW(m_hDlg, WM_EMFW_DONE, 0, 0);
 		return;
 	}
