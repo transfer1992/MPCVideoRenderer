@@ -22,6 +22,7 @@
 #include <atomic>
 #include <optional>
 #include <vector>
+#include <CommCtrl.h>
 #include <evr.h> // for MR_VIDEO_ACCELERATION_SERVICE, because the <mfapi.h> does not contain it
 #include <Mferror.h>
 #include <hidusage.h>
@@ -33,6 +34,8 @@
 #include "VideoRenderer.h"
 #include "SubPic/XySubPicProvider.h"
 #include "SubPic/XySubPicQueueImpl.h"
+
+#pragma comment(lib, "comctl32.lib")
 
 #define WM_SWITCH_FULLSCREEN (WM_APP + 0x1000)
 
@@ -72,49 +75,40 @@
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
 
-LPCWSTR g_pszOldParentWndProc = L"OldParentWndProc";
-LPCWSTR g_pszThis = L"This";
-
-static void RemoveParentWndProc(HWND hWnd)
+static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-	DLog(L"RemoveParentWndProc()");
-	auto pfnOldProc = (WNDPROC)GetPropW(hWnd, g_pszOldParentWndProc);
-	if (pfnOldProc) {
-		SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)pfnOldProc);
-		RemovePropW(hWnd, g_pszOldParentWndProc);
-		RemovePropW(hWnd, g_pszThis);
+	auto pThis = reinterpret_cast<CMpcVideoRenderer*>(dwRefData);
+	if (!pThis) {
+		return DefSubclassProc(hWnd, Msg, wParam, lParam);
 	}
-}
 
-static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
-{
-	auto pfnOldProc = (WNDPROC)GetPropW(hWnd, g_pszOldParentWndProc);
-	auto pThis = static_cast<CMpcVideoRenderer*>(GetPropW(hWnd, g_pszThis));
+	if (Msg == WM_NCDESTROY) {
+		RemoveWindowSubclass(hWnd, ParentWndProc, uIdSubclass);
+		return DefSubclassProc(hWnd, Msg, wParam, lParam);
+	}
 
-	if (Msg == WM_INPUT && pThis && pThis->HandleRawInputMessage((HRAWINPUT)lParam, L"parent_raw")) {
+	if (Msg == WM_INPUT && pThis->GetActive() && pThis->HandleRawInputMessage((HRAWINPUT)lParam, L"parent_raw")) {
 		return 0L;
 	}
 
-	if (pThis && pThis->HandlePageFlipKeyMessage(Msg, wParam, lParam)) {
+	if (pThis->GetActive() && pThis->HandlePageFlipKeyMessage(Msg, wParam, lParam)) {
 		return 0L;
 	}
 
 	switch (Msg) {
-		case WM_DESTROY:
-			SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)pfnOldProc);
-			RemovePropW(hWnd, g_pszOldParentWndProc);
-			RemovePropW(hWnd, g_pszThis);
-			break;
 		case WM_DISPLAYCHANGE:
 			DLog(L"ParentWndProc() - WM_DISPLAYCHANGE");
-			pThis->OnDisplayModeChange(true);
+			if (pThis->GetActive()) {
+				pThis->OnDisplayModeChange(true);
+			}
 			break;
 		case WM_MOVE:
-			if (pThis->m_bExclusiveScreen) {
+			if (pThis->GetActive() && pThis->m_bExclusiveScreen) {
 				// I don't know why, but without this, the filter freezes when switching from fullscreen to window in DX9 mode.
-				SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)pfnOldProc);
-				SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)ParentWndProc);
-			} else {
+				RemoveWindowSubclass(hWnd, ParentWndProc, uIdSubclass);
+				SetWindowSubclass(hWnd, ParentWndProc, uIdSubclass, dwRefData);
+			}
+			else if (pThis->GetActive()) {
 				pThis->OnWindowMove();
 			}
 			break;
@@ -139,7 +133,14 @@ static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM
 */
 	}
 
-	return CallWindowProcW(pfnOldProc, hWnd, Msg, wParam, lParam);
+	return DefSubclassProc(hWnd, Msg, wParam, lParam);
+}
+
+static void RemoveParentWndProc(HWND hWnd, CMpcVideoRenderer* pThis)
+{
+	if (hWnd && pThis) {
+		RemoveWindowSubclass(hWnd, ParentWndProc, reinterpret_cast<UINT_PTR>(pThis));
+	}
 }
 
 //
@@ -151,12 +152,8 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 {
 	DLog(L"CMpcVideoRenderer::CMpcVideoRenderer()");
 
-	auto nPrevInstance = g_nInstance++; // always increment g_nInstance in the constructor
-	if (nPrevInstance > 0) {
-		*phr = E_ABORT;
-		DLog(L"Previous copy of CMpcVideoRenderer found! Initialization aborted.");
-		return;
-	}
+	const int nInstances = g_nInstance.fetch_add(1) + 1; // always decrement g_nInstance in the destructor
+	DLog(L"CMpcVideoRenderer instances: {}", nInstances);
 
 	DLog(L"Windows {}", GetWindowsVersion());
 	DLog(GetNameAndVersion());
@@ -310,10 +307,8 @@ CMpcVideoRenderer::~CMpcVideoRenderer()
 {
 	DLog(L"CMpcVideoRenderer::~CMpcVideoRenderer()");
 
-	UnregisterClassW(g_szClassName, g_hInst);
-
 	if (m_hWndParentMain) {
-		RemoveParentWndProc(m_hWndParentMain);
+		RemoveParentWndProc(m_hWndParentMain, this);
 	}
 
 	if (m_bExclusiveScreen && !m_bIsD3DFullscreen && m_hWndParentMain) {
@@ -326,7 +321,11 @@ CMpcVideoRenderer::~CMpcVideoRenderer()
 		::SendMessageW(m_hWndWindow, WM_CLOSE, 0, 0);
 	}
 
-	g_nInstance--; // always decrement g_nInstance in the destructor
+	const int nRemainInstance = g_nInstance.fetch_sub(1) - 1; // always decrement g_nInstance in the destructor
+	DLog(L"CMpcVideoRenderer instances remaining: {}", nRemainInstance);
+	if (nRemainInstance <= 0) {
+		UnregisterClassW(g_szClassName, g_hInst);
+	}
 }
 
 void CMpcVideoRenderer::NewSegment(REFERENCE_TIME startTime)
@@ -654,6 +653,19 @@ void CMpcVideoRenderer::OnWindowMove()
 	}
 }
 
+void CMpcVideoRenderer::OnInputPinDisconnected()
+{
+	CAutoLock cRendererLock(&m_RendererLock);
+
+	m_bValidBuffer = false;
+	if (m_hWndWindow && !m_bExclusiveScreen) {
+		::ShowWindow(m_hWndWindow, SW_HIDE);
+	}
+	if (m_VideoProcessor) {
+		m_VideoProcessor->Flush();
+	}
+}
+
 STDMETHODIMP CMpcVideoRenderer::NonDelegatingQueryInterface(REFIID riid, void** ppv)
 {
 	CheckPointer(ppv, E_POINTER);
@@ -698,6 +710,9 @@ STDMETHODIMP CMpcVideoRenderer::Run(REFERENCE_TIME rtStart)
 
 	CAutoLock cVideoLock(&m_InterfaceLock);
 	m_filterState = State_Running;
+	if (m_hWndWindow && !m_bExclusiveScreen && !::IsWindowVisible(m_hWndWindow)) {
+		::ShowWindow(m_hWndWindow, SW_SHOWNA);
+	}
 
 	return CBaseVideoRenderer2::Run(rtStart);
 }
@@ -717,6 +732,9 @@ STDMETHODIMP CMpcVideoRenderer::Stop()
 
 	m_filterState = State_Stopped;
 	m_bValidBuffer = false;
+	if (m_hWndWindow && !m_bExclusiveScreen) {
+		::ShowWindow(m_hWndWindow, SW_HIDE);
+	}
 
 	{
 		CAutoLock cRendererLock(&m_RendererLock);
@@ -1006,14 +1024,14 @@ HRESULT CMpcVideoRenderer::Init(const bool bCreateWindow/* = false*/)
 
 	if (hwnd != m_hWndParentMain) {
 		if (m_hWndParentMain) {
-			RemoveParentWndProc(m_hWndParentMain);
+			RemoveParentWndProc(m_hWndParentMain, this);
 		}
 
 		m_hWndParentMain = hwnd;
-		auto pfnOldProc = (WNDPROC)GetWindowLongPtrW(m_hWndParentMain, GWLP_WNDPROC);
-		SetWindowLongPtrW(m_hWndParentMain, GWLP_WNDPROC, (LONG_PTR)ParentWndProc);
-		SetPropW(m_hWndParentMain, g_pszOldParentWndProc, (HANDLE)pfnOldProc);
-		SetPropW(m_hWndParentMain, g_pszThis, (HANDLE)this);
+		if (m_hWndParentMain && !SetWindowSubclass(m_hWndParentMain, ParentWndProc, reinterpret_cast<UINT_PTR>(this), reinterpret_cast<DWORD_PTR>(this))) {
+			const DWORD err = GetLastError();
+			DLog(L"SetWindowSubclass(parent) failed: {}", err);
+		}
 	}
 
 	if (bCreateWindow) {

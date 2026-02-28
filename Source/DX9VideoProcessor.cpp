@@ -19,6 +19,7 @@
 */
 
 #include "stdafx.h"
+#include <atomic>
 #include <mfapi.h> // for MR_BUFFER_SERVICE
 #include <mfidl.h>
 #include <Mferror.h>
@@ -247,6 +248,7 @@ typedef BOOL(WINAPI* pShowWindow)(
 	_In_ int nCmdShow);
 
 pShowWindow pOrigShowWindow = nullptr;
+static std::atomic_int g_dx9HookUsers = 0;
 static BOOL WINAPI pNewShowWindow(
 	_In_ HWND hWnd,
 	_In_ int nCmdShow)
@@ -269,6 +271,9 @@ inline bool HookFunc(T** ppSystemFunction, PVOID pHookFunction)
 CDX9VideoProcessor::CDX9VideoProcessor(CMpcVideoRenderer* pFilter, const Settings_t& config, HRESULT& hr)
 	: CVideoProcessor(pFilter)
 {
+	const int hookUsers = g_dx9HookUsers.fetch_add(1) + 1;
+	DLog(L"DX9 hook users: {}", hookUsers);
+
 	m_bShowStats           = config.bShowStats;
 	m_iResizeStats         = config.iResizeStats;
 	m_iTexFormat           = config.iTexFormat;
@@ -312,11 +317,6 @@ CDX9VideoProcessor::CDX9VideoProcessor(CMpcVideoRenderer* pFilter, const Setting
 	SetDefaultDXVA2ProcAmpRanges(m_DXVA2ProcAmpRanges);
 	SetDefaultDXVA2ProcAmpValues(m_DXVA2ProcAmpValues);
 
-	pOrigSystemParametersInfoA = nullptr;
-	pOrigSetWindowLongA = nullptr;
-	pOrigSetWindowPos = nullptr;
-	pOrigShowWindow = nullptr;
-
 	m_evInit.Reset();
 	m_evResize.Reset();
 	m_evQuit.Reset();
@@ -345,10 +345,20 @@ CDX9VideoProcessor::~CDX9VideoProcessor()
 
 	m_pD3DEx.Release();
 
-	MH_RemoveHook(SystemParametersInfoA);
-	MH_RemoveHook(SetWindowLongA);
-	MH_RemoveHook(SetWindowPos);
-	MH_RemoveHook(ShowWindow);
+	if (g_dx9HookUsers.fetch_sub(1) == 1) {
+		DLog(L"DX9 removing process hooks");
+		MH_RemoveHook(SystemParametersInfoA);
+		MH_RemoveHook(SetWindowLongA);
+		MH_RemoveHook(SetWindowPos);
+		MH_RemoveHook(ShowWindow);
+		pOrigSystemParametersInfoA = nullptr;
+		pOrigSetWindowLongA = nullptr;
+		pOrigSetWindowPos = nullptr;
+		pOrigShowWindow = nullptr;
+	}
+	else {
+		DLog(L"DX9 hook users remaining: {}", g_dx9HookUsers.load());
+	}
 }
 
 bool CDX9VideoProcessor::WaitForVBlank()

@@ -1966,34 +1966,26 @@ void CVRPageFlipPPage::SetControls()
 	GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
 	GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
 
-	bool canUpdateFw = !m_connected;
+	bool canUpdateFw = true;
 	int state = State_Stopped;
 	if (m_pFilterConfig) {
 		if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
-			canUpdateFw = canUpdateFw && (state == State_Stopped);
+			canUpdateFw = (state == State_Stopped);
 		}
 	}
 	GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
 	HWND hFwWarn = GetDlgItem(IDC_EM_FW_DISABLED_WARN);
 	if (hFwWarn) {
-		if (canUpdateFw) {
-			::ShowWindow(hFwWarn, SW_HIDE);
-		}
-		else {
-			std::wstring text = L"FW disabled";
-			const bool connected = m_connected;
-			const bool playing = (state != State_Stopped);
-			if (connected && playing) {
-				text = L"FW disabled: play+conn";
-			}
-			else if (connected) {
-				text = L"FW disabled: connected";
-			}
-			else if (playing) {
-				text = L"FW disabled: playback";
-			}
-			SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, text.c_str());
+		const bool playing = (state != State_Stopped);
+		const bool hasUnsaved = (m_emitterPending || m_emitterDirty);
+		if (!canUpdateFw) {
+			SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW disabled: playback");
 			::ShowWindow(hFwWarn, SW_SHOW);
+		} else if (hasUnsaved) {
+			SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW may lose unsaved emitter settings");
+			::ShowWindow(hFwWarn, SW_SHOW);
+		} else {
+			::ShowWindow(hFwWarn, SW_HIDE);
 		}
 	}
 
@@ -2486,7 +2478,7 @@ HRESULT CVRPageFlipPPage::OnActivate()
 	AddHint(IDC_EM_SAVE_EEPROM, L"Save current emitter settings to EEPROM. Calibration hotkey: B saves to EEPROM.");
 	AddHint(IDC_EM_LOAD_JSON, L"Load emitter settings from JSON.");
 	AddHint(IDC_EM_SAVE_JSON, L"Save emitter settings to JSON.");
-	AddHint(IDC_EM_UPDATE_FIRMWARE, L"Open firmware update dialog. Disabled while playback is active or the emitter is connected.");
+	AddHint(IDC_EM_UPDATE_FIRMWARE, L"Open firmware update dialog. Disabled while playback is active. If connected, the renderer will temporarily disconnect and reconnect automatically.");
 
 	return S_OK;
 }
@@ -2652,19 +2644,32 @@ INT_PTR CVRPageFlipPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, 
 				UpdateEmitterState();
 				UpdateLocalEmitterSettings();
 
-				if (m_connected) {
-					::MessageBoxW(m_hWnd, L"Disconnect from the emitter before updating firmware.", L"Firmware Update", MB_ICONWARNING | MB_OK);
-					return (LRESULT)1;
-				}
-
 				int state = State_Stopped;
 				if (FAILED(m_pFilterConfig->Flt_GetInt("playbackState", &state)) || state != State_Stopped) {
 					::MessageBoxW(m_hWnd, L"Stop playback before updating firmware.", L"Firmware Update", MB_ICONWARNING | MB_OK);
 					return (LRESULT)1;
 				}
 
+				if (m_emitterPending || m_emitterDirty) {
+					const int answer = ::MessageBoxW(
+						m_hWnd,
+						L"Some emitter settings are not applied and/or not saved to EEPROM.\n"
+						L"Updating firmware may lose those settings.\n\n"
+						L"Continue anyway?",
+						L"Firmware Update",
+						MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+					if (answer != IDYES) {
+						return (LRESULT)1;
+					}
+				}
+
+				const bool wasConnected = m_connected;
 				const LocalEmitterSettings prevSettings = m_localSettings;
-				if (!m_localSettings.disableAutoConnect) {
+				if (wasConnected) {
+					ApplyLocalEmitterSettings(true, prevSettings.comPort);
+					m_pFilterConfig->Flt_SetBool("pageflip_emitter_connect", false);
+					UpdateEmitterState();
+				} else if (!m_localSettings.disableAutoConnect) {
 					ApplyLocalEmitterSettings(true, prevSettings.comPort);
 					UpdateLocalEmitterSettings();
 				}
@@ -2679,6 +2684,10 @@ INT_PTR CVRPageFlipPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, 
 				dialog.ShowModal();
 
 				ApplyLocalEmitterSettings(prevSettings.disableAutoConnect, prevSettings.comPort);
+				if (wasConnected) {
+					m_pFilterConfig->Flt_SetBool("pageflip_emitter_connect", true);
+				}
+				UpdateEmitterState();
 				UpdateLocalEmitterSettings();
 				SetControls();
 				return (LRESULT)1;
@@ -2856,11 +2865,11 @@ void CVREmitterPPage::SetControls()
 	GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(enableEmitter);
 	GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
 	GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
-	bool canUpdateFw = !m_connected;
+	bool canUpdateFw = true;
 	if (m_pFilterConfig) {
 		int state = State_Stopped;
 		if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
-			canUpdateFw = canUpdateFw && (state == State_Stopped);
+			canUpdateFw = (state == State_Stopped);
 		}
 	}
 	GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
@@ -3071,7 +3080,7 @@ HRESULT CVREmitterPPage::OnActivate()
 	AddHint(IDC_EM_SAVE_EEPROM, L"Save current emitter settings to EEPROM.");
 	AddHint(IDC_EM_LOAD_JSON, L"Load emitter settings from JSON.");
 	AddHint(IDC_EM_SAVE_JSON, L"Save emitter settings to JSON.");
-	AddHint(IDC_EM_UPDATE_FIRMWARE, L"Open firmware update dialog. Disabled while playback is active or the emitter is connected.");
+	AddHint(IDC_EM_UPDATE_FIRMWARE, L"Open firmware update dialog. Disabled while playback is active. If connected, the renderer will temporarily disconnect and reconnect automatically.");
 
 	return S_OK;
 }
@@ -3158,19 +3167,37 @@ INT_PTR CVREmitterPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, L
 				UpdateEmitterState();
 				UpdateLocalEmitterSettings();
 
-				if (m_connected) {
-					::MessageBoxW(m_hWnd, L"Disconnect from the emitter before updating firmware.", L"Firmware Update", MB_ICONWARNING | MB_OK);
-					return (LRESULT)1;
-				}
-
 				int state = State_Stopped;
 				if (FAILED(m_pFilterConfig->Flt_GetInt("playbackState", &state)) || state != State_Stopped) {
 					::MessageBoxW(m_hWnd, L"Stop playback before updating firmware.", L"Firmware Update", MB_ICONWARNING | MB_OK);
 					return (LRESULT)1;
 				}
 
+				const bool emitterDirty = GetConfigFromControls() != m_cfg;
+				if (emitterDirty || m_pFilterConfig) {
+					bool eepromDirty = false;
+					m_pFilterConfig->Flt_GetBool("pageflip_emitter_dirty", &eepromDirty);
+					if (emitterDirty || eepromDirty) {
+						const int answer = ::MessageBoxW(
+							m_hWnd,
+							L"Some emitter settings are not applied and/or not saved to EEPROM.\n"
+							L"Updating firmware may lose those settings.\n\n"
+							L"Continue anyway?",
+							L"Firmware Update",
+							MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+						if (answer != IDYES) {
+							return (LRESULT)1;
+						}
+					}
+				}
+
+				const bool wasConnected = m_connected;
 				const LocalEmitterSettings prevSettings = m_localSettings;
-				if (!m_localSettings.disableAutoConnect) {
+				if (wasConnected) {
+					ApplyLocalEmitterSettings(true, prevSettings.comPort);
+					m_pFilterConfig->Flt_SetBool("pageflip_emitter_connect", false);
+					UpdateEmitterState();
+				} else if (!m_localSettings.disableAutoConnect) {
 					ApplyLocalEmitterSettings(true, prevSettings.comPort);
 					UpdateLocalEmitterSettings();
 				}
@@ -3185,6 +3212,10 @@ INT_PTR CVREmitterPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, L
 				dialog.ShowModal();
 
 				ApplyLocalEmitterSettings(prevSettings.disableAutoConnect, prevSettings.comPort);
+				if (wasConnected) {
+					m_pFilterConfig->Flt_SetBool("pageflip_emitter_connect", true);
+				}
+				UpdateEmitterState();
 				UpdateLocalEmitterSettings();
 				SetControls();
 				return (LRESULT)1;

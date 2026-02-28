@@ -136,6 +136,17 @@ STDMETHODIMP CVideoRendererInputPin::ReceiveConnection(IPin* pConnector, const A
 	return __super::ReceiveConnection(pConnector, pmt);
 }
 
+STDMETHODIMP CVideoRendererInputPin::BreakConnect()
+{
+	const HRESULT hr = __super::BreakConnect();
+
+	if (m_pBaseRenderer) {
+		m_pBaseRenderer->OnInputPinDisconnected();
+	}
+
+	return hr;
+}
+
 STDMETHODIMP CVideoRendererInputPin::NewSegment(REFERENCE_TIME startTime, REFERENCE_TIME stopTime, double rate)
 {
 	CAutoLock cReceiveLock(&m_csReceive);

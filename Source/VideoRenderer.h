@@ -158,6 +158,7 @@ public:
 	void UpdateDisplayInfo();
 	void OnDisplayModeChange(const bool bReset = false);
 	void OnWindowMove();
+	void OnInputPinDisconnected();
 	void UpdateVideoRectForPageFlip();
 	void UpdateVideoSizeForPageFlip();
 	void ShowPropertyPages();

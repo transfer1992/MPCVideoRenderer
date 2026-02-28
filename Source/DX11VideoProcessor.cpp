@@ -19,6 +19,7 @@
 */
 
 #include "stdafx.h"
+#include <atomic>
 #include <uuids.h>
 #include <Mferror.h>
 #include <Mfidl.h>
@@ -71,6 +72,7 @@ typedef LONG(WINAPI* pSetWindowLongA)(
 	_In_ LONG dwNewLong);
 
 pSetWindowLongA pOrigSetWindowLongADX11 = nullptr;
+static std::atomic_int g_dx11HookUsers = 0;
 static LONG WINAPI pNewSetWindowLongADX11(
 	_In_ HWND hWnd,
 	_In_ int nIndex,
@@ -379,6 +381,9 @@ HRESULT CDX11VideoProcessor::TextureResizeShader(
 CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Settings_t& config, HRESULT& hr)
 	: CVideoProcessor(pFilter)
 {
+	const int hookUsers = g_dx11HookUsers.fetch_add(1) + 1;
+	DLog(L"DX11 hook users: {}", hookUsers);
+
 	m_bShowStats           = config.bShowStats;
 	m_iResizeStats         = config.iResizeStats;
 	m_iTexFormat           = config.iTexFormat;
@@ -416,15 +421,20 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	SetDefaultDXVA2ProcAmpRanges(m_DXVA2ProcAmpRanges);
 	SetDefaultDXVA2ProcAmpValues(m_DXVA2ProcAmpValues);
 
-	pOrigSetWindowPosDX11 = SetWindowPos;
-	auto ret = HookFunc(&pOrigSetWindowPosDX11, pNewSetWindowPosDX11);
-	DLogIf(!ret, L"CDX11VideoProcessor::CDX11VideoProcessor() : hook for SetWindowPos() fail");
+	if (!pOrigSetWindowPosDX11) {
+		pOrigSetWindowPosDX11 = SetWindowPos;
+		const bool ret = HookFunc(&pOrigSetWindowPosDX11, pNewSetWindowPosDX11);
+		DLogIf(!ret, L"CDX11VideoProcessor::CDX11VideoProcessor() : hook for SetWindowPos() fail");
+	}
 
-	pOrigSetWindowLongADX11 = SetWindowLongA;
-	ret = HookFunc(&pOrigSetWindowLongADX11, pNewSetWindowLongADX11);
-	DLogIf(!ret, L"CDX11VideoProcessor::CDX11VideoProcessor() : hook for SetWindowLongA() fail");
+	if (!pOrigSetWindowLongADX11) {
+		pOrigSetWindowLongADX11 = SetWindowLongA;
+		const bool ret = HookFunc(&pOrigSetWindowLongADX11, pNewSetWindowLongADX11);
+		DLogIf(!ret, L"CDX11VideoProcessor::CDX11VideoProcessor() : hook for SetWindowLongA() fail");
+	}
 
-	MH_EnableHook(MH_ALL_HOOKS);
+	MH_EnableHook(SetWindowPos);
+	MH_EnableHook(SetWindowLongA);
 
 	CComPtr<IDXGIAdapter> pDXGIAdapter;
 	for (UINT adapter = 0; m_pDXGIFactory1->EnumAdapters(adapter, &pDXGIAdapter) != DXGI_ERROR_NOT_FOUND; ++adapter) {
@@ -470,8 +480,16 @@ CDX11VideoProcessor::~CDX11VideoProcessor()
 
 	m_pDXGIFactory1.Release();
 
-	MH_RemoveHook(SetWindowPos);
-	MH_RemoveHook(SetWindowLongA);
+	if (g_dx11HookUsers.fetch_sub(1) == 1) {
+		DLog(L"DX11 removing process hooks");
+		MH_RemoveHook(SetWindowPos);
+		MH_RemoveHook(SetWindowLongA);
+		pOrigSetWindowPosDX11 = nullptr;
+		pOrigSetWindowLongADX11 = nullptr;
+	}
+	else {
+		DLog(L"DX11 hook users remaining: {}", g_dx11HookUsers.load());
+	}
 }
 
 bool CDX11VideoProcessor::WaitForVBlank()
