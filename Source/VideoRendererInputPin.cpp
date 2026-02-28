@@ -136,7 +136,7 @@ STDMETHODIMP CVideoRendererInputPin::ReceiveConnection(IPin* pConnector, const A
 	return __super::ReceiveConnection(pConnector, pmt);
 }
 
-STDMETHODIMP CVideoRendererInputPin::BreakConnect()
+HRESULT CVideoRendererInputPin::BreakConnect()
 {
 	const HRESULT hr = __super::BreakConnect();
 
