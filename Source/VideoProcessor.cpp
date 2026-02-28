@@ -685,7 +685,7 @@ std::wstring CVideoProcessor::GetPageFlipStatusText() const
 		text.append(L"\n").append(m_pageFlipSerialMessage);
 	}
 	if (IsPageFlipEmitterDirty()) {
-		text.append(L"\nEmitter settings not saved to EEPROM");
+		text.append(L"\nEmitter settings not saved to EEPROM (press B to save)");
 	}
 
 	const int inputW = static_cast<int>(m_srcWidth);
@@ -748,17 +748,22 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 			: L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
 	 }
 
-	if (!text.empty()) {
-		text.append(L"\n");
-	}
-	if (serialMode) {
-		text.append(L"Opt debug logging: N/A (serial mode)");
-	} else {
-		const bool optLogging = m_pageFlipSerial.IsOptDebugLogging();
-		text.append(std::format(L"Opt debug logging: {}", optLogging ? L"ON" : L"OFF"));
+	if (m_pageFlipShowCalibrationHelp) {
+		if (!text.empty()) {
+			text.append(L"\n");
+		}
+		if (serialMode) {
+			text.append(L"Opt debug logging: N/A (serial mode)");
+		} else {
+			const bool optLogging = m_pageFlipSerial.IsOptDebugLogging();
+			text.append(std::format(L"Opt debug logging: {}", optLogging ? L"ON" : L"OFF"));
+		}
 	}
 	if (IsPageFlipEmitterDirty()) {
-		text.append(L"\nEmitter settings not saved to EEPROM");
+		if (!text.empty()) {
+			text.append(L"\n");
+		}
+		text.append(L"Emitter settings not saved to EEPROM (press B to save)");
 	}
 
 	return text;
