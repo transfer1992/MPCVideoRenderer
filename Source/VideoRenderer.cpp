@@ -1498,6 +1498,11 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetBool(LPCSTR field, bool value)
 		return S_OK;
 	}
 
+	if (!strcmp(field, "pageflip_property_page_open")) {
+		SetPageFlipPropertyPageOpen(value);
+		return S_OK;
+	}
+
 	if (!strcmp(field, "pageflip_emitter_connect")) {
 		CAutoLock cRendererLock(&m_RendererLock);
 		LocalEmitterSettings localSettings = m_VideoProcessor->GetLocalEmitterSettings();
@@ -1951,18 +1956,24 @@ void CMpcVideoRenderer::UpdateVideoSizeForPageFlip()
 		return;
 	}
 
-	CAutoLock cRendererLock(&m_RendererLock);
-
 	CSize aspectNew, framesizeNew;
-	m_VideoProcessor->GetAspectRatio(&aspectNew.cx, &aspectNew.cy);
-	m_VideoProcessor->GetVideoSize(&framesizeNew.cx, &framesizeNew.cy);
+	bool changed = false;
+	{
+		CAutoLock cRendererLock(&m_RendererLock);
+		m_VideoProcessor->GetAspectRatio(&aspectNew.cx, &aspectNew.cy);
+		m_VideoProcessor->GetVideoSize(&framesizeNew.cx, &framesizeNew.cy);
 
-	if (aspectNew != m_videoAspectRatio || framesizeNew != m_videoSize) {
+		if (aspectNew != m_videoAspectRatio || framesizeNew != m_videoSize) {
+			m_videoSize = framesizeNew;
+			m_videoAspectRatio = aspectNew;
+			changed = true;
+		}
+	}
+
+	if (changed) {
 		if (m_pSink) {
 			m_pSink->Notify(EC_VIDEO_SIZE_CHANGED, MAKELPARAM(framesizeNew.cx, framesizeNew.cy), 0);
 		}
-		m_videoSize = framesizeNew;
-		m_videoAspectRatio = aspectNew;
 		if (m_bForceRedrawing) {
 			Redraw();
 		}
@@ -1975,6 +1986,8 @@ void CMpcVideoRenderer::ShowPropertyPages()
 	if (s_open.exchange(true)) {
 		return;
 	}
+
+	SetPageFlipPropertyPageOpen(true);
 
 	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	const bool doUninit = SUCCEEDED(hrInit);
@@ -2018,7 +2031,30 @@ void CMpcVideoRenderer::ShowPropertyPages()
 		CoUninitialize();
 	}
 
+	SetPageFlipPropertyPageOpen(false);
 	s_open = false;
+}
+
+void CMpcVideoRenderer::SetPageFlipPropertyPageOpen(bool open)
+{
+	int refs = 0;
+	if (open) {
+		refs = m_pageFlipPropertyPageRefs.fetch_add(1) + 1;
+	} else {
+		refs = m_pageFlipPropertyPageRefs.fetch_sub(1) - 1;
+		if (refs < 0) {
+			m_pageFlipPropertyPageRefs.store(0);
+			refs = 0;
+		}
+	}
+
+	DLog(L"SetPageFlipPropertyPageOpen({}) refs={}", open ? 1 : 0, refs);
+	UpdateRawInputRegistration();
+}
+
+bool CMpcVideoRenderer::IsPageFlipPropertyPageOpen() const
+{
+	return m_pageFlipPropertyPageRefs.load() > 0;
 }
 
 LRESULT CMpcVideoRenderer::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -2139,34 +2175,44 @@ bool CMpcVideoRenderer::HandleRawInputMessage(HRAWINPUT hRawInput, const wchar_t
 
 void CMpcVideoRenderer::UpdateRawInputRegistration()
 {
-	HWND target = m_hWndParentMain ? m_hWndParentMain : (m_hWndWindow ? m_hWndWindow : m_hWnd);
-	if (!target) {
-		return;
-	}
-
 	bool wantNoLegacy = false;
 	if (m_VideoProcessor) {
 		const PageFlipConfig cfg = m_VideoProcessor->GetPageFlipConfig();
-		wantNoLegacy = cfg.calibrationMode;
+		wantNoLegacy = cfg.calibrationMode && !IsPageFlipPropertyPageOpen();
 	}
 
-	if (m_rawInputRegistered && target == m_hRawInputTarget && wantNoLegacy == m_rawInputNoLegacy) {
-		return;
-	}
+	const HWND targets[] = {
+		m_hWndWindow,
+		m_hWnd,
+		m_hWndParentMain,
+		m_hWndParent
+	};
 
-	RAWINPUTDEVICE rid = {};
-	rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
-	rid.usUsage = HID_USAGE_GENERIC_KEYBOARD;
-	rid.dwFlags = RIDEV_INPUTSINK | (wantNoLegacy ? RIDEV_NOLEGACY : 0);
-	rid.hwndTarget = target;
+	HWND lastTried = nullptr;
+	for (HWND target : targets) {
+		if (!target || target == lastTried) {
+			continue;
+		}
+		lastTried = target;
 
-	if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+		if (m_rawInputRegistered && target == m_hRawInputTarget && wantNoLegacy == m_rawInputNoLegacy) {
+			return;
+		}
+
+		RAWINPUTDEVICE rid = {};
+		rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
+		rid.usUsage = HID_USAGE_GENERIC_KEYBOARD;
+		rid.dwFlags = RIDEV_INPUTSINK | (wantNoLegacy ? RIDEV_NOLEGACY : 0);
+		rid.hwndTarget = target;
+
+		if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+			m_rawInputRegistered = true;
+			m_rawInputNoLegacy = wantNoLegacy;
+			m_hRawInputTarget = target;
+			return;
+		}
+
 		const DWORD err = GetLastError();
-		DLog(L"UpdateRawInputRegistration() failed: {}", err);
-		return;
+		DLog(L"UpdateRawInputRegistration() failed on target {}: {}", (UINT_PTR)target, err);
 	}
-
-	m_rawInputRegistered = true;
-	m_rawInputNoLegacy = wantNoLegacy;
-	m_hRawInputTarget = target;
 }

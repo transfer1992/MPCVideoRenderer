@@ -162,6 +162,8 @@ public:
 	void UpdateVideoRectForPageFlip();
 	void UpdateVideoSizeForPageFlip();
 	void ShowPropertyPages();
+	void SetPageFlipPropertyPageOpen(bool open);
+	bool IsPageFlipPropertyPageOpen() const;
 
 	DECLARE_IUNKNOWN
 	STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void** ppv);
@@ -335,6 +337,7 @@ public:
 	bool m_rawInputRegistered = false;
 	bool m_rawInputNoLegacy = false;
 	HWND m_hRawInputTarget = nullptr;
+	std::atomic_int m_pageFlipPropertyPageRefs = 0;
 
 private:
 	HRESULT Redraw();

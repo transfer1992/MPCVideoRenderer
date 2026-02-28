@@ -123,8 +123,10 @@ void CVideoProcessor::ApplyPageFlipConfig(const PageFlipConfig& config, bool for
 
 	PageFlipConfig cfg;
 	bool calibrationExit = false;
+	bool needVideoRectSizeUpdate = false;
 	{
 		std::scoped_lock lock(m_pageFlipStateMutex);
+		const PageFlipConfig oldCfg = m_pageFlipConfig;
 		const bool wasCalibration = m_pageFlipConfig.calibrationMode;
 		if (wasCalibration && !normalized.calibrationMode) {
 			calibrationExit = true;
@@ -134,6 +136,10 @@ void CVideoProcessor::ApplyPageFlipConfig(const PageFlipConfig& config, bool for
 		}
 
 		m_pageFlipConfig = normalized;
+		needVideoRectSizeUpdate =
+			(oldCfg.enabled != normalized.enabled)
+			|| (oldCfg.defaultAspect != normalized.defaultAspect)
+			|| (oldCfg.displayZoomFactor != normalized.displayZoomFactor);
 		UpdatePageFlipLayout();
 		UpdatePageFlipRate();
 		cfg = m_pageFlipConfig;
@@ -159,8 +165,10 @@ void CVideoProcessor::ApplyPageFlipConfig(const PageFlipConfig& config, bool for
 		cfg.comPort);
 
 	if (m_pFilter) {
-		m_pFilter->UpdateVideoRectForPageFlip();
-		m_pFilter->UpdateVideoSizeForPageFlip();
+		if (needVideoRectSizeUpdate) {
+			m_pFilter->UpdateVideoRectForPageFlip();
+			m_pFilter->UpdateVideoSizeForPageFlip();
+		}
 		m_pFilter->UpdateRawInputRegistration();
 	}
 }
@@ -676,11 +684,7 @@ std::wstring CVideoProcessor::GetPageFlipStatusText() const
 		text.append(L" flip");
 	}
 
-	if (m_pageFlipConfig.calibrationMode) {
-		text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes");
-	} else {
-		text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
-	}
+	text.append(L"\nCtrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
 	if (messageActive && !m_pageFlipSerialMessage.empty()) {
 		text.append(L"\n").append(m_pageFlipSerialMessage);
 	}
@@ -743,9 +747,7 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 		}
 		const std::wstring driveLine = std::format(L"Drive mode: {}", serialMode ? L"serial" : L"optical");
 		appendLine(driveLine.c_str());
-		appendLine(m_pageFlipConfig.calibrationMode
-			? L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F12=flip eyes"
-			: L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
+		appendLine(L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
 	 }
 
 	if (m_pageFlipShowCalibrationHelp) {
@@ -1132,6 +1134,7 @@ bool CVideoProcessor::HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM 
 	const int key = (int)wParam;
 	const bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 	const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	const bool propertyPagesOpen = m_pFilter && m_pFilter->IsPageFlipPropertyPageOpen();
 	const PageFlipConfig cfg = GetPageFlipConfig();
 	const int calibration = cfg.calibrationMode ? 1 : 0;
 	const int enabled = cfg.enabled ? 1 : 0;
@@ -1189,13 +1192,20 @@ bool CVideoProcessor::HandlePageFlipKeyMessage(UINT uMsg, WPARAM wParam, LPARAM 
 		return true;
 	}
 	if (key == VK_F11 && ctrlDown && shiftDown) {
-		if (!cfg.calibrationMode && m_pFilter) {
+		if (m_pFilter) {
 			m_pFilter->ShowPropertyPages();
 			m_pageFlipLogger.Log(PageFlipLogLevel::Info,
 				L"Pageflip key handled: source={} key={} handled=1",
 				source ? source : L"unknown", key);
 			return true;
 		}
+	}
+
+	if (propertyPagesOpen) {
+		m_pageFlipLogger.Log(PageFlipLogLevel::Info,
+			L"Pageflip key ignored: source={} key={} property_pages_open=1",
+			source ? source : L"unknown", key);
+		return false;
 	}
 
 	const bool handled = HandlePageFlipKey(uMsg, wParam, lParam);

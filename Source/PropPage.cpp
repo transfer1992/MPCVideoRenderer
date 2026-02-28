@@ -191,6 +191,14 @@ static bool MultiSzContainsNoCase(const wchar_t* multi, const std::wstring& need
 	return false;
 }
 
+static void NotifyPageFlipPropertyPageOpen(IUnknown* pUnknown, bool open)
+{
+	CComQIPtr<IExFilterConfig> pFilterConfig = pUnknown;
+	if (pFilterConfig) {
+		pFilterConfig->Flt_SetBool("pageflip_property_page_open", open);
+	}
+}
+
 static std::wstring DetectBootloaderPort(const std::wstring& matchOverride)
 {
 	const GUID& guid = GetComPortClassGuid();
@@ -1416,6 +1424,8 @@ HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
 		return E_NOINTERFACE;
 	}
 
+	NotifyPageFlipPropertyPageOpen(pUnk, true);
+
 	return S_OK;
 }
 
@@ -1424,6 +1434,8 @@ HRESULT CVRMainPPage::OnDisconnect()
 	if (m_pVideoRenderer == nullptr) {
 		return E_UNEXPECTED;
 	}
+
+	NotifyPageFlipPropertyPageOpen(m_pVideoRenderer, false);
 
 	if (m_SetsPP.iSDRDisplayNits != m_oldSDRDisplayNits) {
 		// OK or Apply buttons were not pressed. cancel the settings.
@@ -2377,6 +2389,8 @@ HRESULT CVRPageFlipPPage::OnConnect(IUnknown* pUnknown)
 		return E_NOINTERFACE;
 	}
 
+	NotifyPageFlipPropertyPageOpen(pUnknown, true);
+
 	return S_OK;
 }
 
@@ -2385,6 +2399,8 @@ HRESULT CVRPageFlipPPage::OnDisconnect()
 	if (m_pVideoRenderer == nullptr) {
 		return E_UNEXPECTED;
 	}
+
+	NotifyPageFlipPropertyPageOpen(m_pFilterConfig ? (IUnknown*)m_pFilterConfig : (IUnknown*)m_pVideoRenderer, false);
 
 	m_pFilterConfig.Release();
 	m_pVideoRenderer.Release();
@@ -3020,6 +3036,8 @@ HRESULT CVREmitterPPage::OnConnect(IUnknown* pUnknown)
 		return E_NOINTERFACE;
 	}
 
+	NotifyPageFlipPropertyPageOpen(pUnknown, true);
+
 	return S_OK;
 }
 
@@ -3028,6 +3046,8 @@ HRESULT CVREmitterPPage::OnDisconnect()
 	if (m_pVideoRenderer == nullptr) {
 		return E_UNEXPECTED;
 	}
+
+	NotifyPageFlipPropertyPageOpen(m_pFilterConfig ? (IUnknown*)m_pFilterConfig : (IUnknown*)m_pVideoRenderer, false);
 
 	m_pFilterConfig.Release();
 	m_pVideoRenderer.Release();
@@ -3309,6 +3329,8 @@ HRESULT CVRInfoPPage::OnConnect(IUnknown *pUnk)
 		return E_NOINTERFACE;
 	}
 
+	NotifyPageFlipPropertyPageOpen(pUnk, true);
+
 	return S_OK;
 }
 
@@ -3317,6 +3339,8 @@ HRESULT CVRInfoPPage::OnDisconnect()
 	if (m_pVideoRenderer == nullptr) {
 		return E_UNEXPECTED;
 	}
+
+	NotifyPageFlipPropertyPageOpen(m_pVideoRenderer, false);
 
 	m_pVideoRenderer.Release();
 
