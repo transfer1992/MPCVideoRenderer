@@ -329,6 +329,7 @@ CDX9VideoProcessor::~CDX9VideoProcessor()
 {
 	StopPageFlipThread();
 	m_pageFlipSerial.Stop();
+	m_nvidiaVision.Stop();
 
 	m_pFilter->m_pSubPicQueue.Release();
 	m_pSubPicAllocator.Release();

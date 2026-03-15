@@ -91,6 +91,7 @@ CVideoProcessor::~CVideoProcessor()
 {
 	StopPageFlipThread();
 	m_pageFlipSerial.Stop();
+	m_nvidiaVision.Stop();
 	if (m_pageFlipWakeEvent) {
 		CloseHandle(m_pageFlipWakeEvent);
 		m_pageFlipWakeEvent = nullptr;
@@ -104,6 +105,11 @@ void CVideoProcessor::InitPageFlip()
 	m_pageFlipLogPath = GetPageFlipLogPath(m_pageFlipConfigPath);
 	m_pageFlipWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 	m_pageFlipLocalEmitterSettings = LoadLocalEmitterSettings(m_pageFlipConfigPath);
+
+	// Load NVIDIA 3D Vision timing profiles from config folder
+	const std::wstring timingPath = GetPageFlipConfigFolder(m_pageFlipConfigPath) + L"\\MonitorTimings.ini";
+	m_nvidiaVision.LoadTimingProfiles(timingPath);
+
 	PageFlipConfig cfg = LoadPageFlipConfig(m_pageFlipConfigPath);
 	cfg.comPort = m_pageFlipLocalEmitterSettings.comPort;
 	ApplyPageFlipConfig(cfg, true);
@@ -146,6 +152,11 @@ void CVideoProcessor::ApplyPageFlipConfig(const PageFlipConfig& config, bool for
 	}
 
 	m_pageFlipSerial.Start(cfg, &m_pageFlipLogger, m_pageFlipLocalEmitterSettings.disableAutoConnect);
+	if (cfg.enabled && cfg.irDriveMode == 2) {
+		m_nvidiaVision.Start(&m_pageFlipLogger);
+	} else {
+		m_nvidiaVision.Stop();
+	}
 	if (cfg.enabled) {
 		EnsurePageFlipThread();
 	} else {
@@ -531,7 +542,11 @@ void CVideoProcessor::PageFlipThreadProc()
 			break;
 		}
 		m_pageFlipSkipVBlank = waited;
+		if (late) {
+			m_pageFlipLogger.Log(PageFlipLogLevel::Warning, L"Pageflip: LATE frame, eye={} (not toggling)", eyeValue);
+		}
 		m_pageFlipSerial.QueueSignal(eye);
+		m_nvidiaVision.QueueSignal(eye);
 
 		{
 			CAutoLock cRendererLock(&m_pFilter->m_RendererLock);
@@ -667,8 +682,13 @@ std::wstring CVideoProcessor::GetPageFlipStatusText() const
 	const wchar_t* rateMode = (m_pageFlipConfig.rateHz <= 0.0) ? L"auto" : L"fixed";
 	const std::wstring comPort = m_pageFlipConfig.comPort.empty() ? L"auto" : m_pageFlipConfig.comPort;
 
-	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
-	const wchar_t* driveMode = (driveModeValue == 1) ? L"serial" : L"optical";
+	int driveModeValue = 0;
+	if (m_nvidiaVision.IsConnected()) {
+		driveModeValue = 2;
+	} else if (m_pageFlipSerial.IsConnected()) {
+		driveModeValue = m_pageFlipConfig.irDriveMode;
+	}
+	const wchar_t* driveMode = (driveModeValue == 2) ? L"nvidia_vision" : (driveModeValue == 1) ? L"serial" : L"optical";
 
 	std::wstring text = std::format(L"Pageflip: {} {} {:.3f} Hz {} drive={} COM={} zoom={}% par={:.3g}%",
 		eyeStr,
@@ -716,8 +736,14 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 
 	std::scoped_lock lock(m_pageFlipStateMutex);
 	std::wstring text;
-	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	int driveModeValue = 0;
+	if (m_nvidiaVision.IsConnected()) {
+		driveModeValue = 2;
+	} else if (m_pageFlipSerial.IsConnected()) {
+		driveModeValue = m_pageFlipConfig.irDriveMode;
+	}
 	const bool serialMode = driveModeValue == 1;
+	const bool nvidiaMode = driveModeValue == 2;
 	const uint64_t now = GetPreciseTick();
 	const uint64_t showWindow = GetPreciseTicksPerSecondI() * 2;
 	if (!m_pageFlipCalibrationMessage.empty()
@@ -732,7 +758,7 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 			text.append(line);
 		};
 		appendLine(L"G: Toggle calibration help overlay.");
-		appendLine(L"T: Toggle drive mode (0=optical, 1=serial).");
+		appendLine(L"T: Toggle drive mode (0=optical, 1=serial, 2=nvidia_vision).");
 		appendLine(L"B: Save current emitter settings to EEPROM.");
 		appendLine(L"I/K: (us) Delay after signal before activating glasses.");
 		appendLine(L"O/L: (us) Duration to keep glasses active after activation.");
@@ -745,7 +771,8 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 			appendLine(L"N/M: Width of black border that blocks video content from the trigger boxes.");
 			appendLine(L"P: Toggle optical debug logging.");
 		}
-		const std::wstring driveLine = std::format(L"Drive mode: {}", serialMode ? L"serial" : L"optical");
+		const wchar_t* driveModeStr = nvidiaMode ? L"nvidia_vision" : (serialMode ? L"serial" : L"optical");
+		const std::wstring driveLine = std::format(L"Drive mode: {}", driveModeStr);
 		appendLine(driveLine.c_str());
 		appendLine(L"Ctrl+Shift+F# Hotkeys: F8=2d/3d  F9=osd  F10=calibration mode  F11=open properties  F12=flip eyes");
 	 }
@@ -754,8 +781,8 @@ std::wstring CVideoProcessor::GetPageFlipCalibrationText() const
 		if (!text.empty()) {
 			text.append(L"\n");
 		}
-		if (serialMode) {
-			text.append(L"Opt debug logging: N/A (serial mode)");
+		if (serialMode || nvidiaMode) {
+			text.append(std::format(L"Opt debug logging: N/A ({} mode)", nvidiaMode ? L"nvidia_vision" : L"serial"));
 		} else {
 			const bool optLogging = m_pageFlipSerial.IsOptDebugLogging();
 			text.append(std::format(L"Opt debug logging: {}", optLogging ? L"ON" : L"OFF"));
@@ -870,7 +897,7 @@ bool CVideoProcessor::ShouldDrawPageFlipBoxes() const
 		return false;
 	}
 
-	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	const int driveModeValue = m_nvidiaVision.IsConnected() ? 2 : (m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0);
 	if (driveModeValue != 0) {
 		return false;
 	}
@@ -943,8 +970,9 @@ bool CVideoProcessor::HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	const int key = (int)wParam;
 	const bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-	const int driveModeValue = m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0;
+	const int driveModeValue = m_nvidiaVision.IsConnected() ? 2 : (m_pageFlipSerial.IsConnected() ? m_pageFlipConfig.irDriveMode : 0);
 	const bool serialMode = driveModeValue == 1;
+	const bool nvidiaMode = driveModeValue == 2;
 
 	PageFlipConfig updated = m_pageFlipConfig;
 	bool changed = false;
@@ -968,8 +996,8 @@ bool CVideoProcessor::HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		m_pageFlipCalibrationMessageTick = GetPreciseTick();
 		return true;
 	case 'P': {
-		if (serialMode) {
-			m_pageFlipCalibrationMessage = L"opt debug logging unavailable in serial mode";
+		if (serialMode || nvidiaMode) {
+			m_pageFlipCalibrationMessage = std::format(L"opt debug logging unavailable in {} mode", nvidiaMode ? L"nvidia_vision" : L"serial");
 			m_pageFlipCalibrationMessageTick = GetPreciseTick();
 			return true;
 		}
@@ -997,13 +1025,12 @@ bool CVideoProcessor::HandlePageFlipKey(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		displayChanged = true;
 		break;
 	case 'T':
-		if (!m_pageFlipSerial.IsConnected()) {
-			m_pageFlipCalibrationMessage = L"drive mode toggle requires emitter connection";
-			m_pageFlipCalibrationMessageTick = GetPreciseTick();
-			return true;
+		updated.irDriveMode = (updated.irDriveMode + 1) % 3;
+		{
+			const wchar_t* modeStr = (updated.irDriveMode == 2) ? L"nvidia_vision" :
+				(updated.irDriveMode == 1) ? L"serial" : L"optical";
+			m_pageFlipCalibrationMessage = std::format(L"drive mode: {}", modeStr);
 		}
-		updated.irDriveMode = (updated.irDriveMode == 1) ? 0 : 1;
-		m_pageFlipCalibrationMessage = updated.irDriveMode == 1 ? L"drive mode: serial" : L"drive mode: optical";
 		m_pageFlipCalibrationMessageTick = GetPreciseTick();
 		changed = true;
 		displayChanged = true;
