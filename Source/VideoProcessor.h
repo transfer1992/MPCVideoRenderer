@@ -224,6 +224,7 @@ protected:
 	std::wstring GetPageFlipStatusText() const;
 	std::wstring GetPageFlipCalibrationText() const;
 	void OnPageFlipSampleReceived();
+	virtual void ApplyPageFlipStagedFrame() {}
 	virtual bool WaitForVBlank() { return false; }
 
 	struct PageFlipOverlayLayout {

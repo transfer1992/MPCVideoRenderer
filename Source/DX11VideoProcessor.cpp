@@ -691,6 +691,7 @@ void CDX11VideoProcessor::ReleaseVP()
 	}
 
 	m_TexSrcVideo.Release();
+	m_TexSrcVideoStaging.Release();
 	m_TexConvertOutput.Release();
 	m_TexResize.Release();
 	m_TexsPostScale.Release();
@@ -1191,6 +1192,80 @@ HRESULT CDX11VideoProcessor::MemCopyToTexSrcVideo(const BYTE* srcData, const int
 	}
 
 	return hr;
+}
+
+HRESULT CDX11VideoProcessor::MemCopyToTexSrcVideoStaging(const BYTE* srcData, const int srcPitch)
+{
+	HRESULT hr = S_FALSE;
+	D3D11_MAPPED_SUBRESOURCE mappedResource = {};
+
+	if (m_TexSrcVideoStaging.pTexture2) {
+		hr = m_pDeviceContext->Map(m_TexSrcVideoStaging.pTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+		if (SUCCEEDED(hr)) {
+			m_pCopyPlaneFn(m_srcHeight, (BYTE*)mappedResource.pData, mappedResource.RowPitch, srcData, srcPitch);
+			m_pDeviceContext->Unmap(m_TexSrcVideoStaging.pTexture, 0);
+
+			hr = m_pDeviceContext->Map(m_TexSrcVideoStaging.pTexture2, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+			if (SUCCEEDED(hr)) {
+				const UINT cromaH = m_srcHeight / m_srcParams.pDX11Planes->div_chroma_h;
+				const int cromaPitch = (m_TexSrcVideoStaging.pTexture3) ? srcPitch / m_srcParams.pDX11Planes->div_chroma_w : srcPitch;
+				srcData += srcPitch * m_srcHeight;
+				m_pCopyPlaneFn(cromaH, (BYTE*)mappedResource.pData, mappedResource.RowPitch, srcData, cromaPitch);
+				m_pDeviceContext->Unmap(m_TexSrcVideoStaging.pTexture2, 0);
+
+				if (m_TexSrcVideoStaging.pTexture3) {
+					hr = m_pDeviceContext->Map(m_TexSrcVideoStaging.pTexture3, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+					if (SUCCEEDED(hr)) {
+						srcData += cromaPitch * cromaH;
+						m_pCopyPlaneFn(cromaH, (BYTE*)mappedResource.pData, mappedResource.RowPitch, srcData, cromaPitch);
+						m_pDeviceContext->Unmap(m_TexSrcVideoStaging.pTexture3, 0);
+					}
+				}
+			}
+		}
+	} else {
+		hr = m_pDeviceContext->Map(m_TexSrcVideoStaging.pTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+		if (SUCCEEDED(hr)) {
+			const BYTE* src = (srcPitch < 0) ? srcData + srcPitch * (1 - (int)m_srcLines) : srcData;
+			m_pCopyPlaneFn(m_srcLines, (BYTE*)mappedResource.pData, mappedResource.RowPitch, src, srcPitch);
+			m_pDeviceContext->Unmap(m_TexSrcVideoStaging.pTexture, 0);
+		}
+	}
+
+	return hr;
+}
+
+void CDX11VideoProcessor::ApplyPageFlipStagedFrame()
+{
+	if (!m_pageFlipStagingDirty.exchange(false)) {
+		return;
+	}
+
+	const int path = m_pageFlipStagedPath.load();
+
+	switch (path) {
+	case 1: // GPU + D3D11VP
+		m_pDeviceContext->Flush(); // ensure GPU finished decoding into the texture slice
+		m_D3D11VP.SetInputVideoData(m_pageFlipStagedGpuTex, m_pageFlipStagedSample, m_pageFlipStagedArraySlice, m_pageFlipStagedFormat);
+		m_pageFlipStagedGpuTex.Release();
+		m_pageFlipStagedSample.Release();
+		break;
+	case 2: // GPU + Shader
+		m_pDeviceContext->CopyResource(m_TexSrcVideo.pTexture, m_TexSrcVideoStaging.pTexture);
+		break;
+	case 3: // CPU + D3D11VP
+		m_pDeviceContext->CopyResource(m_D3D11VP.GetNextInputTexture(m_pageFlipStagedFormat), m_TexSrcVideoStaging.pTexture);
+		break;
+	case 4: // CPU + Shader
+		m_pDeviceContext->CopyResource(m_TexSrcVideo.pTexture, m_TexSrcVideoStaging.pTexture);
+		if (m_TexSrcVideoStaging.pTexture2) {
+			m_pDeviceContext->CopyResource(m_TexSrcVideo.pTexture2, m_TexSrcVideoStaging.pTexture2);
+		}
+		if (m_TexSrcVideoStaging.pTexture3) {
+			m_pDeviceContext->CopyResource(m_TexSrcVideo.pTexture3, m_TexSrcVideoStaging.pTexture3);
+		}
+		break;
+	}
 }
 
 HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContext *pContext)
@@ -1902,6 +1977,7 @@ HRESULT CDX11VideoProcessor::InitializeD3D11VP(const FmtConvParams_t& params, co
 	DLog(L"CDX11VideoProcessor::InitializeD3D11VP() started with input surface: {}, {} x {}", DXGIFormatToString(dxgiFormat), width, height);
 
 	m_TexSrcVideo.Release();
+	m_TexSrcVideoStaging.Release();
 
 	const bool bHdrPassthrough = m_bHdrDisplayModeEnabled && (SourceIsPQorHLG() || (m_bVPUseRTXVideoHDR && params.CDepth == 8));
 	m_D3D11OutputFmt = m_InternalTexFmt;
@@ -1936,6 +2012,11 @@ HRESULT CDX11VideoProcessor::InitializeD3D11VP(const FmtConvParams_t& params, co
 		DLog(L"CDX11VideoProcessor::InitializeD3D11VP() : m_TexSrcVideo.Create() failed with error {}", HR2Str(hr));
 		return hr;
 	}
+	hr = m_TexSrcVideoStaging.Create(m_pDevice, dxgiFormat, width, height, Tex2D_DynamicShaderWriteNoSRV);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::InitializeD3D11VP() : m_TexSrcVideoStaging.Create() failed with error {}", HR2Str(hr));
+		return hr;
+	}
 
 	m_srcWidth       = width;
 	m_srcHeight      = height;
@@ -1957,6 +2038,11 @@ HRESULT CDX11VideoProcessor::InitializeTexVP(const FmtConvParams_t& params, cons
 	HRESULT hr = m_TexSrcVideo.CreateEx(m_pDevice, srcDXGIFormat, params.pDX11Planes, width, height, Tex2D_DynamicShaderWrite);
 	if (FAILED(hr)) {
 		DLog(L"CDX11VideoProcessor::InitializeTexVP() : m_TexSrcVideo.CreateEx() failed with error {}", HR2Str(hr));
+		return hr;
+	}
+	hr = m_TexSrcVideoStaging.CreateEx(m_pDevice, srcDXGIFormat, params.pDX11Planes, width, height, Tex2D_DynamicShaderWrite);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::InitializeTexVP() : m_TexSrcVideoStaging.CreateEx() failed with error {}", HR2Str(hr));
 		return hr;
 	}
 
@@ -2353,12 +2439,28 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 		}
 #endif
 
-		if (m_D3D11VP.IsReady()) {
-			m_D3D11VP.SetInputVideoData(pD3D11Texture2D, pSample, ArraySlice, m_SampleFormat);
+		if (UsePageFlipThread()) {
+			// PageFlip double-buffering: defer texture update to safe window
+			if (m_D3D11VP.IsReady()) {
+				m_pageFlipStagedGpuTex = pD3D11Texture2D;
+				m_pageFlipStagedSample = pSample;
+				m_pageFlipStagedArraySlice = ArraySlice;
+				m_pageFlipStagedFormat = m_SampleFormat;
+				m_pageFlipStagedPath = 1;
+			} else {
+				D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
+				m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideoStaging.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
+				m_pageFlipStagedPath = 2;
+			}
+			m_pageFlipStagingDirty = true;
 		} else {
-			// here should be used CopySubresourceRegion instead of CopyResource
-			D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
-			m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideo.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
+			if (m_D3D11VP.IsReady()) {
+				m_D3D11VP.SetInputVideoData(pD3D11Texture2D, pSample, ArraySlice, m_SampleFormat);
+			} else {
+				// here should be used CopySubresourceRegion instead of CopyResource
+				D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
+				m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideo.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
+			}
 		}
 	}
 	else {
@@ -2370,12 +2472,24 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 		BYTE* data = nullptr;
 		const int size = pSample->GetActualDataLength();
 		if (size >= abs(m_srcPitch) * (int)m_srcLines && S_OK == pSample->GetPointer(&data)) {
-			// do not use UpdateSubresource for D3D11 VP here
-			// because it can cause green screens and freezes on some configurations
-			hr = MemCopyToTexSrcVideo(data, m_srcPitch);
-			if (m_D3D11VP.IsReady()) {
-				// ID3D11VideoProcessor does not use textures with D3D11_CPU_ACCESS_WRITE flag
-				m_pDeviceContext->CopyResource(m_D3D11VP.GetNextInputTexture(m_SampleFormat), m_TexSrcVideo.pTexture);
+			if (UsePageFlipThread()) {
+				// PageFlip double-buffering: copy to staging texture
+				hr = MemCopyToTexSrcVideoStaging(data, m_srcPitch);
+				if (m_D3D11VP.IsReady()) {
+					m_pageFlipStagedFormat = m_SampleFormat;
+					m_pageFlipStagedPath = 3;
+				} else {
+					m_pageFlipStagedPath = 4;
+				}
+				m_pageFlipStagingDirty = true;
+			} else {
+				// do not use UpdateSubresource for D3D11 VP here
+				// because it can cause green screens and freezes on some configurations
+				hr = MemCopyToTexSrcVideo(data, m_srcPitch);
+				if (m_D3D11VP.IsReady()) {
+					// ID3D11VideoProcessor does not use textures with D3D11_CPU_ACCESS_WRITE flag
+					m_pDeviceContext->CopyResource(m_D3D11VP.GetNextInputTexture(m_SampleFormat), m_TexSrcVideo.pTexture);
+				}
 			}
 		}
 	}
@@ -3816,6 +3930,12 @@ void CDX11VideoProcessor::SetStereo3dTransform(int value)
 void CDX11VideoProcessor::Flush()
 {
 	ResetPageFlipState();
+
+	// Clear staging state to prevent stale data after seek
+	m_pageFlipStagingDirty = false;
+	m_pageFlipStagedPath = 0;
+	m_pageFlipStagedGpuTex.Release();
+	m_pageFlipStagedSample.Release();
 
 	if (m_D3D11VP.IsReady()) {
 		m_D3D11VP.ResetFrameOrder();

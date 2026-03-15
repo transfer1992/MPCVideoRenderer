@@ -68,6 +68,7 @@ private:
 #endif
 
 	Tex11Video_t m_TexSrcVideo; // for copy of frame
+	Tex11Video_t m_TexSrcVideoStaging; // PageFlip double-buffering: CopySample writes here
 	Tex2D_t m_TexConvertOutput;
 	Tex2D_t m_TexResize;        // for intermediate result of two-pass resize
 	CTex2DRing m_TexsPostScale;
@@ -199,6 +200,14 @@ private:
 	std::atomic_bool m_bDisplayModeChangeAfterHDRToggle = false;
 	CCritSec m_HDRToggleLock;
 
+	// PageFlip double-buffering: deferred CopySample state
+	CComPtr<ID3D11Texture2D> m_pageFlipStagedGpuTex;
+	CComPtr<IMediaSample> m_pageFlipStagedSample;
+	UINT m_pageFlipStagedArraySlice = 0;
+	D3D11_VIDEO_FRAME_FORMAT m_pageFlipStagedFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+	std::atomic<int> m_pageFlipStagedPath{0}; // 0=none, 1=GPU+VP, 2=GPU+shader, 3=CPU+VP, 4=CPU+shader
+	std::atomic_bool m_pageFlipStagingDirty{false};
+
 	bool m_bHDRModeChangeOutside = false;
 
 	void FillDisplayParams();
@@ -234,6 +243,8 @@ private:
 	void CalcStatsParams() override;
 
 	HRESULT MemCopyToTexSrcVideo(const BYTE* srcData, const int srcPitch);
+	HRESULT MemCopyToTexSrcVideoStaging(const BYTE* srcData, const int srcPitch);
+	void ApplyPageFlipStagedFrame() override;
 
 	bool Preferred10BitOutput() {
 		return m_DisplayBitsPerChannel >= 10 && (m_InternalTexFmt == DXGI_FORMAT_R10G10B10A2_UNORM || m_InternalTexFmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
