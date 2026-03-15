@@ -34,6 +34,7 @@
 #include "SubPic/DX11SubPic.h"
 
 #include <atomic>
+#include <mutex>
 
 #define TEST_SHADER 0
 
@@ -201,6 +202,7 @@ private:
 	CCritSec m_HDRToggleLock;
 
 	// PageFlip double-buffering: deferred CopySample state
+	std::mutex m_pageFlipStagingMutex; // protects Apply vs Flush race during seek
 	CComPtr<ID3D11Texture2D> m_pageFlipStagedGpuTex;
 	CComPtr<IMediaSample> m_pageFlipStagedSample;
 	UINT m_pageFlipStagedArraySlice = 0;

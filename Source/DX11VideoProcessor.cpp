@@ -1236,6 +1236,11 @@ HRESULT CDX11VideoProcessor::MemCopyToTexSrcVideoStaging(const BYTE* srcData, co
 
 void CDX11VideoProcessor::ApplyPageFlipStagedFrame()
 {
+	if (!m_pageFlipStagingDirty.load()) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(m_pageFlipStagingMutex);
 	if (!m_pageFlipStagingDirty.exchange(false)) {
 		return;
 	}
@@ -2440,18 +2445,23 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 
 		if (UsePageFlipThread()) {
 			// PageFlip double-buffering: defer texture update to safe window
-			if (m_D3D11VP.IsReady()) {
-				m_pageFlipStagedGpuTex = pD3D11Texture2D;
-				m_pageFlipStagedSample = pSample;
-				m_pageFlipStagedArraySlice = ArraySlice;
-				m_pageFlipStagedFormat = m_SampleFormat;
-				m_pageFlipStagedPath = 1;
-			} else {
-				D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
-				m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideoStaging.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
-				m_pageFlipStagedPath = 2;
+			// try_lock: CopySample must never block (DirectShow constraint)
+			std::unique_lock<std::mutex> lock(m_pageFlipStagingMutex, std::try_to_lock);
+			if (lock.owns_lock()) {
+				if (m_D3D11VP.IsReady()) {
+					m_pageFlipStagedGpuTex = pD3D11Texture2D;
+					m_pageFlipStagedSample = pSample;
+					m_pageFlipStagedArraySlice = ArraySlice;
+					m_pageFlipStagedFormat = m_SampleFormat;
+					m_pageFlipStagedPath = 1;
+				} else {
+					D3D11_BOX srcBox = { 0, 0, 0, m_srcWidth, m_srcHeight, 1 };
+					m_pDeviceContext->CopySubresourceRegion(m_TexSrcVideoStaging.pTexture, 0, 0, 0, 0, pD3D11Texture2D, ArraySlice, &srcBox);
+					m_pageFlipStagedPath = 2;
+				}
+				m_pageFlipStagingDirty = true;
 			}
-			m_pageFlipStagingDirty = true;
+			// if lock failed: Apply or Flush in progress, skip this frame (next CopySample will deliver)
 		} else {
 			if (m_D3D11VP.IsReady()) {
 				m_D3D11VP.SetInputVideoData(pD3D11Texture2D, pSample, ArraySlice, m_SampleFormat);
@@ -2473,14 +2483,17 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 		if (size >= abs(m_srcPitch) * (int)m_srcLines && S_OK == pSample->GetPointer(&data)) {
 			if (UsePageFlipThread()) {
 				// PageFlip double-buffering: copy to staging texture
-				hr = MemCopyToTexSrcVideoStaging(data, m_srcPitch);
-				if (m_D3D11VP.IsReady()) {
-					m_pageFlipStagedFormat = m_SampleFormat;
-					m_pageFlipStagedPath = 3;
-				} else {
-					m_pageFlipStagedPath = 4;
+				std::unique_lock<std::mutex> lock(m_pageFlipStagingMutex, std::try_to_lock);
+				if (lock.owns_lock()) {
+					hr = MemCopyToTexSrcVideoStaging(data, m_srcPitch);
+					if (m_D3D11VP.IsReady()) {
+						m_pageFlipStagedFormat = m_SampleFormat;
+						m_pageFlipStagedPath = 3;
+					} else {
+						m_pageFlipStagedPath = 4;
+					}
+					m_pageFlipStagingDirty = true;
 				}
-				m_pageFlipStagingDirty = true;
 			} else {
 				// do not use UpdateSubresource for D3D11 VP here
 				// because it can cause green screens and freezes on some configurations
@@ -3931,10 +3944,14 @@ void CDX11VideoProcessor::Flush()
 	ResetPageFlipState();
 
 	// Clear staging state to prevent stale data after seek
-	m_pageFlipStagingDirty = false;
-	m_pageFlipStagedPath = 0;
-	m_pageFlipStagedGpuTex.Release();
-	m_pageFlipStagedSample.Release();
+	// Mutex prevents race with ApplyPageFlipStagedFrame on PageFlipThread
+	{
+		std::lock_guard<std::mutex> lock(m_pageFlipStagingMutex);
+		m_pageFlipStagingDirty = false;
+		m_pageFlipStagedPath = 0;
+		m_pageFlipStagedGpuTex.Release();
+		m_pageFlipStagedSample.Release();
+	}
 
 	if (m_D3D11VP.IsReady()) {
 		m_D3D11VP.ResetFrameOrder();
