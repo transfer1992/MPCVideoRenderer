@@ -456,6 +456,9 @@ void CVideoProcessor::StopPageFlipThread()
 	}
 	m_pageFlipThreadRunning = false;
 	m_pageFlipStopRequested = false;
+
+	// Apply any pending staged frame so normal rendering path has valid data
+	ApplyPageFlipStagedFrame();
 }
 
 void CVideoProcessor::PageFlipThreadProc()
@@ -533,18 +536,29 @@ void CVideoProcessor::PageFlipThreadProc()
 		m_pageFlipSkipVBlank = waited;
 		m_pageFlipSerial.QueueSignal(eye);
 
+		// Double-buffering: on LEFT eye, apply any pending staged frame before rendering
+		// This ensures the first frame is visible and both eyes see the same data
+		if (eyeValue == 0) {
+			ApplyPageFlipStagedFrame();
+		}
+
 		{
 			CAutoLock cRendererLock(&m_pFilter->m_RendererLock);
 			if (m_pFilter->m_filterState != State_Stopped && m_pFilter->m_bValidBuffer) {
 				Render(0, INVALID_TIME);
 			}
 		}
-
 		m_pageFlipSkipVBlank = false;
 		m_pageFlipLastPresentTick = GetPreciseTick();
 
 		if (!late) {
 			m_pageFlipEye.store(eyeValue ? 0 : 1);
+		}
+
+		// Double-buffering: apply staged frame in safe window
+		// After RIGHT eye (eyeValue==1) or during late recovery (safe since no active pair)
+		if (eyeValue == 1 || late) {
+			ApplyPageFlipStagedFrame();
 		}
 
 		if (late) {
@@ -558,6 +572,9 @@ void CVideoProcessor::PageFlipThreadProc()
 			m_pageFlipNextTick = nextTick;
 		}
 	}
+
+	// Apply any remaining staged frame before exiting
+	ApplyPageFlipStagedFrame();
 
 	m_pageFlipThreadRunning = false;
 }
