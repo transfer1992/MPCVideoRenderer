@@ -2,7 +2,7 @@
 *.aps
 *.bak
 /.vs
-/_bin
+_bin/
 /revision.h
 /signinfo.txt
 /distrib/*.ax

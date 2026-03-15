@@ -459,6 +459,7 @@ CDX11VideoProcessor::~CDX11VideoProcessor()
 {
 	StopPageFlipThread();
 	m_pageFlipSerial.Stop();
+	m_nvidiaVision.Stop();
 
 	for (const auto& [displayName, state] : m_hdrModeSavedState) {
 		DisplayConfig_t displayConfig = {};

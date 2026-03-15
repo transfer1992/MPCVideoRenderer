@@ -157,6 +157,7 @@ protected:
 
 	PageFlipLogger m_pageFlipLogger;
 	PageFlipSerial m_pageFlipSerial;
+	NvidiaVisionUSB m_nvidiaVision;
 	LocalEmitterSettings m_pageFlipLocalEmitterSettings;
 	std::atomic<bool> m_pageFlipEmitterDirty = false;
 	bool m_pageFlipShowCalibrationHelp = true;

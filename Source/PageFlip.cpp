@@ -10,6 +10,11 @@
 #include <setupapi.h>
 #include <devguid.h>
 #include <regstr.h>
+// GUID_DEVINTERFACE_USB_DEVICE from usbiodef.h
+// Defined manually to avoid initguid.h conflicts with precompiled headers
+// {A5DCBF10-6530-11D2-901F-00C04FB951ED}
+static const GUID GUID_DEVINTERFACE_USB_DEVICE_LOCAL =
+	{ 0xA5DCBF10, 0x6530, 0x11D2, { 0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED } };
 
 #include "PageFlip.h"
 #include "Utils/StringUtil.h"
@@ -1768,4 +1773,353 @@ void PageFlipSerial::HandleOptDebugLine(const std::string& line)
 		right_duplicate_detected,
 		right_duplicate_ignored,
 		right_sent_ir);
+}
+
+// ============================================================================
+// NvidiaVisionUSB - NVIDIA 3D Vision IR emitter USB driver
+// Based on 3DVisionActivator by FlintEastwood
+// ============================================================================
+
+// Known NVIDIA 3D Vision USB hardware IDs (VID 0955)
+static const char* const kNvidiaVisionPids[] = {
+	"usb#vid_0955&pid_0007",
+	"usb#vid_0955&pid_7001",
+	"usb#vid_0955&pid_7002",
+	"usb#vid_0955&pid_7003",
+	"usb#vid_0955&pid_7004",
+	"usb#vid_0955&pid_7008",
+	"usb#vid_0955&pid_7009",
+	"usb#vid_0955&pid_700a",
+	"usb#vid_0955&pid_700c",
+	"usb#vid_0955&pid_700d&mi_00",
+	"usb#vid_0955&pid_700e&mi_00"
+};
+
+NvidiaVisionUSB::~NvidiaVisionUSB()
+{
+	Stop();
+}
+
+std::wstring NvidiaVisionUSB::FindUsbDevice()
+{
+	HDEVINFO devInfo = SetupDiGetClassDevsW(
+		&GUID_DEVINTERFACE_USB_DEVICE_LOCAL, nullptr, nullptr,
+		DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+	if (devInfo == INVALID_HANDLE_VALUE) {
+		return {};
+	}
+
+	SP_DEVICE_INTERFACE_DATA ifData = {};
+	ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+	for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, nullptr,
+		&GUID_DEVINTERFACE_USB_DEVICE_LOCAL, i, &ifData); ++i)
+	{
+		DWORD requiredSize = 0;
+		SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, nullptr, 0, &requiredSize, nullptr);
+		if (requiredSize == 0) {
+			continue;
+		}
+
+		std::vector<BYTE> detailBuf(requiredSize);
+		auto* detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuf.data());
+		detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+		if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, requiredSize, nullptr, nullptr)) {
+			continue;
+		}
+
+		std::wstring path = detail->DevicePath;
+		std::string pathLower(path.begin(), path.end());
+		for (auto& c : pathLower) {
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+
+		for (const char* pid : kNvidiaVisionPids) {
+			if (pathLower.find(pid) != std::string::npos) {
+				SetupDiDestroyDeviceInfoList(devInfo);
+				if (m_logger) {
+					m_logger->Log(PageFlipLogLevel::Info, L"NVIDIA Vision: found USB device '{}'.", path);
+				}
+				return path;
+			}
+		}
+	}
+
+	SetupDiDestroyDeviceInfoList(devInfo);
+	return {};
+}
+
+HANDLE NvidiaVisionUSB::OpenUsbPipe(const std::wstring& devicePath, const std::wstring& pipeName)
+{
+	std::wstring fullPath = devicePath + L"\\" + pipeName;
+	HANDLE handle = CreateFileW(
+		fullPath.c_str(),
+		GENERIC_WRITE | GENERIC_READ,
+		FILE_SHARE_WRITE | FILE_SHARE_READ,
+		nullptr,
+		OPEN_EXISTING,
+		0,
+		nullptr);
+	if (handle == INVALID_HANDLE_VALUE && m_logger) {
+		m_logger->Log(PageFlipLogLevel::Warning, L"NVIDIA Vision: failed to open pipe '{}'.", pipeName);
+	}
+	return handle;
+}
+
+template <typename T>
+DWORD NvidiaVisionUSB::WriteToPipe(HANDLE pipe, T buffer, int bytes)
+{
+	if (pipe == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	DWORD bytesWritten = 0;
+	WriteFile(pipe, reinterpret_cast<const char*>(buffer), bytes, &bytesWritten, nullptr);
+	return bytesWritten;
+}
+
+bool NvidiaVisionUSB::InitEmitter()
+{
+	if (m_profiles.empty()) {
+		if (m_logger) {
+			m_logger->Log(PageFlipLogLevel::Error, L"NVIDIA Vision: no timing profiles loaded.");
+		}
+		return false;
+	}
+
+	const TimingProfile& prof = m_profiles[m_currentProfile];
+	float rate = prof.refreshRateHz;
+	float x_us = prof.x_us;
+	float y_us = prof.y_us;
+	float z_us = prof.z_us;
+	float w_us = prof.w_us;
+
+	// Convert timing values to emitter clock units
+	// T0 runs at 4MHz, T2 runs at 12MHz (48MHz CPU / 12 and /4)
+	int x = static_cast<int>(-x_us * 4 + 1);
+	int y = static_cast<int>(-y_us * 4 + 1);
+	int z = static_cast<int>(-z_us * 12 + 1);
+	int w = static_cast<int>(-w_us * 12 + 1);
+	int timeout = static_cast<int>(rate * 4); // idle timeout in frames
+
+	int sequence[] = {
+		0x00031842,
+		0x00180001, w, x, y, 0x22242830, 0x0405080a, z,
+		0x00021c01, 0x00000002,
+		0x00021e01, timeout,
+		0x00011b01, 0x00000007,
+		0x00031840
+	};
+
+	HANDLE readPipe = OpenUsbPipe(m_devicePath, L"PIPE03");
+	char readBuffer[7] = {};
+
+	WriteToPipe(m_pipe0, sequence, 4);            // 42 18 03 00
+	if (readPipe != INVALID_HANDLE_VALUE) {
+		DWORD bytesRead = 0;
+		ReadFile(readPipe, readBuffer, 7, &bytesRead, nullptr);
+	}
+	WriteToPipe(m_pipe0, sequence + 1, 28);       // timing data
+	WriteToPipe(m_pipe0, sequence + 8, 6);        // 01 1c 02 00, 02 00
+	WriteToPipe(m_pipe0, sequence + 10, 6);       // 01 1e 02 00, timeout
+	WriteToPipe(m_pipe0, sequence + 12, 5);       // 01 1b 01 00, 07
+	WriteToPipe(m_pipe0, sequence + 13, 4);       // 40 18 03 00
+
+	if (readPipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(readPipe);
+	}
+
+	if (m_logger) {
+		m_logger->Log(PageFlipLogLevel::Info,
+			L"NVIDIA Vision: initialized emitter for '{}' @ {:.3f} Hz (x={:.1f} y={:.1f} z={:.1f} w={:.1f} us).",
+			prof.monitorId, rate, x_us, y_us, z_us, w_us);
+	}
+
+	return true;
+}
+
+void NvidiaVisionUSB::Start(PageFlipLogger* logger)
+{
+	std::scoped_lock lock(m_mutex);
+	m_logger = logger;
+
+	if (m_connected.load()) {
+		return;
+	}
+
+	m_devicePath = FindUsbDevice();
+	if (m_devicePath.empty()) {
+		if (m_logger) {
+			m_logger->Log(PageFlipLogLevel::Warning, L"NVIDIA Vision: no emitter found.");
+		}
+		return;
+	}
+
+	m_pipe0 = OpenUsbPipe(m_devicePath, L"PIPE02");
+	m_pipe1 = OpenUsbPipe(m_devicePath, L"PIPE00");
+
+	if (m_pipe0 == INVALID_HANDLE_VALUE || m_pipe1 == INVALID_HANDLE_VALUE) {
+		Stop();
+		return;
+	}
+
+	if (m_profiles.empty()) {
+		TimingProfile defaultProfile;
+		defaultProfile.monitorId = L"Default 120Hz";
+		defaultProfile.edidId = L"Default";
+		m_profiles.push_back(defaultProfile);
+	}
+
+	if (!InitEmitter()) {
+		Stop();
+		return;
+	}
+
+	m_connected = true;
+
+	if (m_logger) {
+		m_logger->Log(PageFlipLogLevel::Info, L"NVIDIA Vision: emitter started.");
+	}
+}
+
+void NvidiaVisionUSB::Stop()
+{
+	std::scoped_lock lock(m_mutex);
+	m_connected = false;
+
+	if (m_pipe0 != INVALID_HANDLE_VALUE) {
+		CloseHandle(m_pipe0);
+		m_pipe0 = INVALID_HANDLE_VALUE;
+	}
+	if (m_pipe1 != INVALID_HANDLE_VALUE) {
+		CloseHandle(m_pipe1);
+		m_pipe1 = INVALID_HANDLE_VALUE;
+	}
+	m_devicePath.clear();
+
+	if (m_logger) {
+		m_logger->Log(PageFlipLogLevel::Info, L"NVIDIA Vision: emitter stopped.");
+	}
+}
+
+void NvidiaVisionUSB::QueueSignal(PageFlipEye eye)
+{
+	if (!m_connected.load()) {
+		return;
+	}
+
+	std::scoped_lock lock(m_mutex);
+	if (m_pipe1 == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	// Direct synchronous write, matching the original 3DVisionActivator protocol.
+	// 0xAA 0xFE 0x00 0x00 = left eye, 0xAA 0xFF 0x00 0x00 = right eye
+	// followed by 4 bytes timing offset (0xffff0000 as in original 3DVisionActivator)
+	bool isLeft = (eye == PageFlipEye::Left);
+	int sequence[] = { isLeft ? 0x0000feaa : 0x0000ffaa, (int)0xffff0000 };
+	WriteToPipe(m_pipe1, sequence, 8);
+}
+
+void NvidiaVisionUSB::SetTimingProfile(const TimingProfile& profile)
+{
+	std::scoped_lock lock(m_mutex);
+	m_profiles.clear();
+	m_profiles.push_back(profile);
+	m_currentProfile = 0;
+	if (m_connected.load()) {
+		InitEmitter();
+	}
+}
+
+bool NvidiaVisionUSB::LoadTimingProfiles(const std::wstring& path)
+{
+	std::ifstream fin(path);
+	if (!fin.is_open()) {
+		if (m_logger) {
+			m_logger->Log(PageFlipLogLevel::Warning, L"NVIDIA Vision: cannot open timing file '{}'.", path);
+		}
+		return false;
+	}
+
+	std::vector<TimingProfile> profiles;
+	TimingProfile current;
+	bool hasData = false;
+
+	std::string line;
+	while (std::getline(fin, line)) {
+		if (line.empty()) {
+			continue;
+		}
+
+		auto extractValue = [&](const std::string& key) -> std::string {
+			size_t pos = line.find(key);
+			if (pos == std::string::npos) {
+				return {};
+			}
+			return line.substr(pos + key.size());
+		};
+
+		std::string val;
+		if (!(val = extractValue("Monitor:")).empty()) {
+			if (hasData) {
+				profiles.push_back(current);
+				current = TimingProfile{};
+			}
+			current.monitorId = std::wstring(val.begin(), val.end());
+			hasData = true;
+		}
+		if (!(val = extractValue("EDID_ID:")).empty()) {
+			current.edidId = std::wstring(val.begin(), val.end());
+		}
+		if (!(val = extractValue("RefreshRateHz:")).empty()) {
+			current.refreshRateHz = std::stof(val);
+		}
+		if (!(val = extractValue("X_us:")).empty()) {
+			current.x_us = std::stof(val);
+		}
+		if (!(val = extractValue("Y_us:")).empty()) {
+			current.y_us = std::stof(val);
+		}
+		if (!(val = extractValue("Z_us:")).empty()) {
+			current.z_us = std::stof(val);
+		}
+		if (!(val = extractValue("W_us:")).empty()) {
+			current.w_us = std::stof(val);
+		}
+	}
+
+	if (hasData) {
+		profiles.push_back(current);
+	}
+
+	if (profiles.empty()) {
+		return false;
+	}
+
+	std::scoped_lock lock(m_mutex);
+	m_profiles = std::move(profiles);
+	m_currentProfile = 0;
+
+	if (m_logger) {
+		m_logger->Log(PageFlipLogLevel::Info, L"NVIDIA Vision: loaded {} timing profile(s).",
+			static_cast<int>(m_profiles.size()));
+	}
+
+	if (m_connected.load()) {
+		InitEmitter();
+	}
+	return true;
+}
+
+void NvidiaVisionUSB::NextProfile()
+{
+	std::scoped_lock lock(m_mutex);
+	if (m_profiles.empty()) {
+		return;
+	}
+	m_currentProfile = (m_currentProfile + 1) % static_cast<int>(m_profiles.size());
+	if (m_connected.load()) {
+		InitEmitter();
+	}
 }

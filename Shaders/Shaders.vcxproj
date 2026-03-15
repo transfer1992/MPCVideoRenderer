@@ -261,7 +261,7 @@
       <AdditionalOptions>/O2</AdditionalOptions>
     </FxCompile>
     <PostBuildEvent>
-      <Command>compile_shaders.cmd</Command>
+      <Command>$(ProjectDir)compile_shaders.cmd</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

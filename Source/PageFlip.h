@@ -217,6 +217,54 @@ private:
 	PageFlipLogLevel m_level = PageFlipLogLevel::Error;
 };
 
+class NvidiaVisionUSB {
+public:
+	NvidiaVisionUSB() = default;
+	~NvidiaVisionUSB();
+
+	void Start(PageFlipLogger* logger);
+	void Stop();
+	void QueueSignal(PageFlipEye eye);
+
+	bool IsConnected() const { return m_connected.load(); }
+
+	struct TimingProfile {
+		std::wstring monitorId;
+		std::wstring edidId;
+		float refreshRateHz = 120.0f;
+		float x_us = 1.0f;
+		float y_us = 7333.0f;
+		float z_us = 8333.34f;
+		float w_us = 4735.0f;
+	};
+
+	void SetTimingProfile(const TimingProfile& profile);
+	bool LoadTimingProfiles(const std::wstring& path);
+	void NextProfile();
+
+private:
+	static constexpr int kNvidiaVendorId = 0x0955;
+
+	std::wstring FindUsbDevice();
+	HANDLE OpenUsbPipe(const std::wstring& devicePath, const std::wstring& pipeName);
+	bool InitEmitter();
+
+	template <typename T>
+	DWORD WriteToPipe(HANDLE pipe, T buffer, int bytes);
+
+	std::mutex m_mutex;
+	std::atomic<bool> m_connected = false;
+
+	HANDLE m_pipe0 = INVALID_HANDLE_VALUE; // PIPE02 - command pipe
+	HANDLE m_pipe1 = INVALID_HANDLE_VALUE; // PIPE00 - signal pipe
+	std::wstring m_devicePath;
+
+	std::vector<TimingProfile> m_profiles;
+	int m_currentProfile = 0;
+
+	PageFlipLogger* m_logger = nullptr;
+};
+
 class PageFlipSerial {
 public:
 	PageFlipSerial() = default;
