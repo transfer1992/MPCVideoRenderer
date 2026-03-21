@@ -1914,7 +1914,8 @@ void CVRPageFlipPPage::SetControls()
 	SendDlgItemMessageW(IDC_EM_DRIVE_MODE, CB_RESETCONTENT, 0, 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"0 (optical)", 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"1 (serial)", 1);
-	if (driveMode != 0 && driveMode != 1) {
+	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"2 (nvidia_vision)", 2);
+	if (driveMode != 0 && driveMode != 1 && driveMode != 2) {
 		const std::wstring label = std::format(L"Other ({})", driveMode);
 		ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, label.c_str(), driveMode);
 	}
@@ -2472,7 +2473,7 @@ HRESULT CVRPageFlipPPage::OnActivate()
 	AddHint(IDC_EM_DISCONNECT, L"Disconnect from the emitter.");
 	AddHint(IDC_EM_DISABLE_AUTOCONNECT, L"Disable automatic scanning and reconnection attempts.");
 	AddHint(IDC_EM_FIRMWARE, L"The version of your IR emitter firmware.");
-	AddHint(IDC_EM_DRIVE_MODE, L"0=Optical, 1=PCSerial. Calibration hotkey: T toggles drive mode. (Firmware 20+ for drive mode setting.)");
+	AddHint(IDC_EM_DRIVE_MODE, L"0=Optical, 1=PCSerial, 2=NvidiaVision. Calibration hotkey: T toggles drive mode. (Firmware 20+ for drive mode setting.)");
 	AddHint(IDC_EM_PROTOCOL, L"0=Samsung07, 1=Xpand, 2=3DVision, 3=Sharp, 4=Sony, 5=Panasonic, 6=PanasonicCustom, 7=DLPLink.");
 	AddHint(IDC_EM_FRAME_DELAY, L"(us) Delay after signal before activating glasses.");
 	AddHint(IDC_EM_FRAME_DURATION, L"(us) Duration to keep glasses active after activation.");
@@ -3063,6 +3064,7 @@ HRESULT CVREmitterPPage::OnActivate()
 	SendDlgItemMessageW(IDC_EM_DRIVE_MODE, CB_RESETCONTENT, 0, 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"0 (optical)", 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"1 (serial)", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"2 (nvidia_vision)", 2);
 
 	UpdateEmitterState();
 	if (m_connected && m_pFilterConfig) {
@@ -3078,7 +3080,7 @@ HRESULT CVREmitterPPage::OnActivate()
 	AddHint(IDC_EM_DISCONNECT, L"Disconnect from the emitter.");
 	AddHint(IDC_EM_DISABLE_AUTOCONNECT, L"Disable automatic scanning and reconnection attempts.");
 	AddHint(IDC_EM_FIRMWARE, L"The version of your IR emitter firmware.");
-	AddHint(IDC_EM_DRIVE_MODE, L"0=Optical, 1=PCSerial. Calibration hotkey: T toggles drive mode. (Firmware 20+ for drive mode setting.)");
+	AddHint(IDC_EM_DRIVE_MODE, L"0=Optical, 1=PCSerial, 2=NvidiaVision. Calibration hotkey: T toggles drive mode. (Firmware 20+ for drive mode setting.)");
 	AddHint(IDC_EM_PROTOCOL, L"0=Samsung07, 1=Xpand, 2=3DVision, 3=Sharp, 4=Sony, 5=Panasonic, 6=PanasonicCustom, 7=DLPLink.");
 	AddHint(IDC_EM_FRAME_DELAY, L"(us) Delay after signal before activating glasses.");
 	AddHint(IDC_EM_FRAME_DURATION, L"(us) Duration to keep glasses active after activation.");
