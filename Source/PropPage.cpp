@@ -1910,7 +1910,8 @@ void CVRPageFlipPPage::SetControls()
 	SetDlgItemTextW(IDC_PF_CONFIG_PATH, m_configPath.c_str());
 	SetDlgItemTextW(IDC_EDIT2, GetNameAndVersion());
 
-	const int driveMode = m_connected ? m_cfg.irDriveMode : 0;
+	const bool nvidiaMode = m_cfg.irDriveMode == 2;
+	const int driveMode = (m_connected || nvidiaMode) ? m_cfg.irDriveMode : 0;
 	SendDlgItemMessageW(IDC_EM_DRIVE_MODE, CB_RESETCONTENT, 0, 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"0 (optical)", 0);
 	ComboBox_AddStringData(m_hWnd, IDC_EM_DRIVE_MODE, L"1 (serial)", 1);
@@ -1940,7 +1941,9 @@ void CVRPageFlipPPage::SetControls()
 	SetDlgItemTextW(IDC_EM_IGNORE_ALL, std::to_wstring(m_cfg.optIgnoreAllDuplicates).c_str());
 	SetDlgItemTextW(IDC_EM_SENSOR_FILTER, std::to_wstring(m_cfg.optSensorFilterMode).c_str());
 
-	if (!m_connected) {
+	if (nvidiaMode) {
+		SetDlgItemTextW(IDC_EM_FIRMWARE, L"N/A (NVIDIA Vision)");
+	} else if (!m_connected) {
 		SetDlgItemTextW(IDC_EM_FIRMWARE, L"Not Connected");
 	} else if (m_firmwareVersion > 0) {
 		SetDlgItemTextW(IDC_EM_FIRMWARE, std::to_wstring(m_firmwareVersion).c_str());
@@ -1951,54 +1954,93 @@ void CVRPageFlipPPage::SetControls()
 	PopulatePorts(m_localSettings.comPort);
 	CheckDlgButton(IDC_EM_DISABLE_AUTOCONNECT, m_localSettings.disableAutoConnect ? BST_CHECKED : BST_UNCHECKED);
 
-	GetDlgItem(IDC_EM_CONNECT).EnableWindow(!m_connected);
-	GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(m_connected);
-	GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(TRUE);
+	if (nvidiaMode) {
+		// NVIDIA Vision uses USB directly, not COM — disable all open-3d-oled emitter controls
+		GetDlgItem(IDC_EM_CONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_COMPORT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_REFRESH).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_READ).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_APPLY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(TRUE);
+		GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(FALSE);
+	} else {
+		GetDlgItem(IDC_EM_CONNECT).EnableWindow(!m_connected);
+		GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(m_connected);
+		GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(TRUE);
 
-	const BOOL enableEmitter = m_connected ? TRUE : FALSE;
-	GetDlgItem(IDC_EM_READ).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_APPLY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
-
-	bool canUpdateFw = true;
-	int state = State_Stopped;
-	if (m_pFilterConfig) {
-		if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
-			canUpdateFw = (state == State_Stopped);
-		}
+		const BOOL enableEmitter = m_connected ? TRUE : FALSE;
+		GetDlgItem(IDC_EM_READ).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_APPLY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
 	}
-	GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
-	HWND hFwWarn = GetDlgItem(IDC_EM_FW_DISABLED_WARN);
-	if (hFwWarn) {
-		const bool playing = (state != State_Stopped);
-		const bool hasUnsaved = (m_emitterPending || m_emitterDirty);
-		if (!canUpdateFw) {
-			SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW disabled: playback");
-			::ShowWindow(hFwWarn, SW_SHOW);
-		} else if (hasUnsaved) {
-			SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW may lose unsaved emitter settings");
-			::ShowWindow(hFwWarn, SW_SHOW);
-		} else {
+
+	if (nvidiaMode) {
+		GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(FALSE);
+		HWND hFwWarn = GetDlgItem(IDC_EM_FW_DISABLED_WARN);
+		if (hFwWarn) {
 			::ShowWindow(hFwWarn, SW_HIDE);
+		}
+	} else {
+		bool canUpdateFw = true;
+		int state = State_Stopped;
+		if (m_pFilterConfig) {
+			if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
+				canUpdateFw = (state == State_Stopped);
+			}
+		}
+		GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
+		HWND hFwWarn = GetDlgItem(IDC_EM_FW_DISABLED_WARN);
+		if (hFwWarn) {
+			const bool playing = (state != State_Stopped);
+			const bool hasUnsaved = (m_emitterPending || m_emitterDirty);
+			if (!canUpdateFw) {
+				SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW disabled: playback");
+				::ShowWindow(hFwWarn, SW_SHOW);
+			} else if (hasUnsaved) {
+				SetDlgItemTextW(IDC_EM_FW_DISABLED_WARN, L"FW may lose unsaved emitter settings");
+				::ShowWindow(hFwWarn, SW_SHOW);
+			} else {
+				::ShowWindow(hFwWarn, SW_HIDE);
+			}
 		}
 	}
 
@@ -2270,24 +2312,25 @@ void CVRPageFlipPPage::SetOpticalControlsEnabled(bool enabled)
 
 void CVRPageFlipPPage::UpdateModeControls()
 {
-	const int driveMode = m_connected ? m_cfg.irDriveMode : 0;
+	const bool nvidiaMode = m_cfg.irDriveMode == 2;
+	const int driveMode = (m_connected || nvidiaMode) ? m_cfg.irDriveMode : 0;
 	const bool serialMode = driveMode == 1;
 	const bool opticalMode = driveMode == 0;
 	const bool otherMode = !serialMode && !opticalMode;
 
-	const BOOL enableSelect = m_connected ? TRUE : FALSE;
+	const BOOL enableSelect = (m_connected && !nvidiaMode) ? TRUE : FALSE;
 	GetDlgItem(IDC_PF_MODE_SERIAL).EnableWindow(enableSelect);
 	GetDlgItem(IDC_PF_MODE_OPTICAL).EnableWindow(enableSelect);
 	GetDlgItem(IDC_PF_MODE_OTHER).EnableWindow(FALSE);
 	CWindow modeNote = GetDlgItem(IDC_PF_MODE_NOTE);
 	if (modeNote) {
-		modeNote.ShowWindow(m_connected ? SW_HIDE : SW_SHOW);
+		modeNote.ShowWindow((m_connected || nvidiaMode) ? SW_HIDE : SW_SHOW);
 	}
 
 	const int checkId = otherMode ? IDC_PF_MODE_OTHER : (serialMode ? IDC_PF_MODE_SERIAL : IDC_PF_MODE_OPTICAL);
 	::CheckRadioButton(m_hWnd, IDC_PF_MODE_SERIAL, IDC_PF_MODE_OTHER, checkId);
 
-	SetOpticalControlsEnabled(!serialMode);
+	SetOpticalControlsEnabled(opticalMode);
 }
 
 void CVRPageFlipPPage::UpdateEmitterDirty()
@@ -2824,7 +2867,8 @@ void CVREmitterPPage::SetControls()
 {
 	m_loading = true;
 
-	const int driveMode = m_connected ? m_cfg.irDriveMode : 0;
+	const bool nvidiaMode = m_cfg.irDriveMode == 2;
+	const int driveMode = (m_connected || nvidiaMode) ? m_cfg.irDriveMode : 0;
 	ComboBox_SelectByItemData(m_hWnd, IDC_EM_DRIVE_MODE, (LONG_PTR)driveMode);
 	SetDlgItemTextW(IDC_EM_PROTOCOL, std::to_wstring(m_cfg.irProtocol).c_str());
 	SetDlgItemTextW(IDC_EM_FRAME_DELAY, std::to_wstring(m_cfg.irFrameDelay).c_str());
@@ -2844,7 +2888,9 @@ void CVREmitterPPage::SetControls()
 	SetDlgItemTextW(IDC_EM_IGNORE_ALL, std::to_wstring(m_cfg.optIgnoreAllDuplicates).c_str());
 	SetDlgItemTextW(IDC_EM_SENSOR_FILTER, std::to_wstring(m_cfg.optSensorFilterMode).c_str());
 
-	if (!m_connected) {
+	if (nvidiaMode) {
+		SetDlgItemTextW(IDC_EM_FIRMWARE, L"N/A (NVIDIA Vision)");
+	} else if (!m_connected) {
 		SetDlgItemTextW(IDC_EM_FIRMWARE, L"Not Connected");
 	} else if (m_firmwareVersion > 0) {
 		SetDlgItemTextW(IDC_EM_FIRMWARE, std::to_wstring(m_firmwareVersion).c_str());
@@ -2855,41 +2901,72 @@ void CVREmitterPPage::SetControls()
 	PopulatePorts(m_localSettings.comPort);
 	CheckDlgButton(IDC_EM_DISABLE_AUTOCONNECT, m_localSettings.disableAutoConnect ? BST_CHECKED : BST_UNCHECKED);
 
-	GetDlgItem(IDC_EM_CONNECT).EnableWindow(!m_connected);
-	GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(m_connected);
-	GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(TRUE);
+	if (nvidiaMode) {
+		GetDlgItem(IDC_EM_CONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_COMPORT).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_REFRESH).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_READ).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_APPLY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(TRUE);
+		GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(FALSE);
+		GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(FALSE);
+	} else {
+		GetDlgItem(IDC_EM_CONNECT).EnableWindow(!m_connected);
+		GetDlgItem(IDC_EM_DISCONNECT).EnableWindow(m_connected);
+		GetDlgItem(IDC_EM_DISABLE_AUTOCONNECT).EnableWindow(TRUE);
 
-	const BOOL enableEmitter = m_connected ? TRUE : FALSE;
-	GetDlgItem(IDC_EM_READ).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_APPLY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
-	GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
-	bool canUpdateFw = true;
-	if (m_pFilterConfig) {
-		int state = State_Stopped;
-		if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
-			canUpdateFw = (state == State_Stopped);
+		const BOOL enableEmitter = m_connected ? TRUE : FALSE;
+		GetDlgItem(IDC_EM_READ).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_APPLY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SAVE_EEPROM).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_LOAD_JSON).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SAVE_JSON).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_DRIVE_MODE).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_PROTOCOL).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FRAME_DELAY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FRAME_DURATION).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SIGNAL_SPACING).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_FLIP_EYES).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_AVG_TIMING).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_TARGET_FRAMETIME).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_BLOCK_DELAY).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_MIN_THRESHOLD).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_THRESH_HIGH).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_THRESH_LOW).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_IGNORE_DURING_IR).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_DUP_REALTIME).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_OUTPUT_STATS).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_IGNORE_ALL).EnableWindow(enableEmitter);
+		GetDlgItem(IDC_EM_SENSOR_FILTER).EnableWindow(enableEmitter);
+		bool canUpdateFw = true;
+		if (m_pFilterConfig) {
+			int state = State_Stopped;
+			if (SUCCEEDED(m_pFilterConfig->Flt_GetInt("playbackState", &state))) {
+				canUpdateFw = (state == State_Stopped);
+			}
 		}
+		GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
 	}
-	GetDlgItem(IDC_EM_UPDATE_FIRMWARE).EnableWindow(canUpdateFw ? TRUE : FALSE);
 
 	m_loading = false;
 }
